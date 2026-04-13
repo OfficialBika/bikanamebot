@@ -1,4 +1,4 @@
-# Hallow Match Bot
+# Waifu Name Bot
 
 Python Telegram bot for:
 - saving forwarded photo/video character posts
