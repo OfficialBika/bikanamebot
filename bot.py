@@ -1,0 +1,754 @@
+import asyncio
+import hashlib
+import logging
+import os
+import re
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from io import BytesIO
+from typing import Any, Optional
+
+import cv2
+import imagehash
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
+    CopyTextButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
+from PIL import Image
+
+load_dotenv()
+
+# -----------------------------------------------------
+# Config
+# -----------------------------------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
+DB_NAME = os.getenv("DB_NAME", "hallow_match_bot").strip()
+OWNER_IDS = {
+    int(x.strip())
+    for x in os.getenv("OWNER_IDS", os.getenv("OWNER_ID", "")).split(",")
+    if x.strip().isdigit()
+}
+OWNER_AUTOSAVE_FORWARDS = os.getenv("OWNER_AUTOSAVE_FORWARDS", "true").lower() == "true"
+PHOTO_PHASH_THRESHOLD = int(os.getenv("PHOTO_PHASH_THRESHOLD", "8"))
+VIDEO_FRAME_THRESHOLD = int(os.getenv("VIDEO_FRAME_THRESHOLD", "10"))
+VIDEO_AVG_THRESHOLD = int(os.getenv("VIDEO_AVG_THRESHOLD", "12"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "@Official_Bika").strip()
+DEFAULT_COMMAND = os.getenv("DEFAULT_COMMAND", "/hallow").strip() or "/hallow"
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required")
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI is required")
+if not OWNER_IDS:
+    raise RuntimeError("OWNER_ID or OWNER_IDS is required")
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("hallow-match-bot")
+
+# -----------------------------------------------------
+# Database
+# -----------------------------------------------------
+client = AsyncIOMotorClient(MONGO_URI)
+db = client[DB_NAME]
+items = db.items
+approved_users = db.approved_users
+sudo_users = db.sudo_users
+known_users = db.known_users
+
+# -----------------------------------------------------
+# Helpers
+# -----------------------------------------------------
+NAME_PATTERNS = [
+    re.compile(r"^\s*Character\s*Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*NAME\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+]
+ANIME_PATTERNS = [
+    re.compile(r"^\s*Anime\s*Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*Anime\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+]
+RARITY_PATTERNS = [
+    re.compile(r"^\s*Rarity\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+]
+CARD_ID_PATTERNS = [
+    re.compile(r"^\s*ID\s*:\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
+]
+
+COMMAND_PATTERNS = [
+    re.compile(r"(?:using|use|hint|full)\s*:?\s*(/[A-Za-z0-9_]+)\b", re.IGNORECASE),
+    re.compile(r"\b(/[A-Za-z0-9_]+)\s*\[[^\]]*name[^\]]*\]", re.IGNORECASE),
+    re.compile(r"\b(/[A-Za-z0-9_]+)\s*\([^\)]*name[^\)]*\)", re.IGNORECASE),
+    re.compile(r"\b(/[A-Za-z0-9_]+)\s+[\w\[\]ɴᴀᴍᴇNAMEname_\-]+", re.IGNORECASE),
+]
+
+router = Router()
+
+
+@dataclass
+class MediaMeta:
+    media_type: str
+    file_id: str
+    file_unique_id: str
+    sha256: str
+    phash: Optional[str] = None
+    frame_hashes: Optional[list[str]] = None
+
+
+@dataclass
+class ParsedText:
+    name: Optional[str]
+    anime_name: Optional[str]
+    rarity: Optional[str]
+    card_id: Optional[str]
+    command_name: Optional[str]
+    raw_text: str
+
+
+def html_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def clean_value(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def normalize_name(name: str) -> str:
+    return clean_value(name).casefold()
+
+
+def parse_field(text: str, patterns: list[re.Pattern]) -> Optional[str]:
+    for pattern in patterns:
+        match = pattern.search(text or "")
+        if match:
+            return clean_value(match.group(1))
+    return None
+
+
+def clean_command_name(value: str) -> str:
+    cmd = clean_value(value)
+    if not cmd:
+        return DEFAULT_COMMAND
+    if not cmd.startswith("/"):
+        cmd = f"/{cmd.lstrip('/')}"
+    return cmd.split()[0]
+
+
+def parse_command_name(text: str) -> Optional[str]:
+    raw = text or ""
+
+    # Prefer explicit [NAME] templates or hint/full sections.
+    for pattern in COMMAND_PATTERNS:
+        match = pattern.search(raw)
+        if match:
+            return clean_command_name(match.group(1))
+
+    return None
+
+
+def parse_caption_text(text: Optional[str]) -> ParsedText:
+    raw = text or ""
+    return ParsedText(
+        name=parse_field(raw, NAME_PATTERNS),
+        anime_name=parse_field(raw, ANIME_PATTERNS),
+        rarity=parse_field(raw, RARITY_PATTERNS),
+        card_id=parse_field(raw, CARD_ID_PATTERNS),
+        command_name=parse_command_name(raw),
+        raw_text=raw,
+    )
+
+
+def get_hint_name(full_name: str) -> str:
+    name = clean_value(full_name)
+    if not name:
+        return ""
+    return name.split(" ")[0]
+
+
+def get_message_text(message: Message) -> str:
+    return message.caption or message.text or ""
+
+
+def extract_media_handle(message: Message):
+    if message.photo:
+        return "photo", message.photo[-1]
+    if message.video:
+        return "video", message.video
+    return None, None
+
+
+def powered_by_html() -> str:
+    username = OWNER_USERNAME.strip().lstrip("@")
+    if not username:
+        return "Powered by Official Bika."
+    return f'Powered by <a href="https://t.me/{html_escape(username)}">Official Bika</a>.'
+
+
+def build_result_text(item: dict[str, Any]) -> str:
+    name = clean_value(item.get("name") or "Unknown")
+    command_name = clean_command_name(item.get("command_name") or DEFAULT_COMMAND)
+    hint_name = get_hint_name(name)
+
+    lines = [
+        f"<b>NAME :</b> {html_escape(name)}",
+        "────────────────",
+        f"🔹 <b>Hint :</b> <code>{html_escape(f'{command_name} {hint_name}')}</code>",
+        f"🔸 <b>Full :</b> <code>{html_escape(f'{command_name} {name}')}</code>",
+        "",
+        powered_by_html(),
+    ]
+    return "\n".join(lines)
+
+
+def build_copy_keyboard(command_name: str, name: str) -> InlineKeyboardMarkup:
+    hint_cmd = f"{command_name} {get_hint_name(name)}".strip()
+    full_cmd = f"{command_name} {clean_value(name)}".strip()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📋 Copy Hint",
+                    copy_text=CopyTextButton(text=hint_cmd[:256]),
+                ),
+                InlineKeyboardButton(
+                    text="📋 Copy Full",
+                    copy_text=CopyTextButton(text=full_cmd[:256]),
+                ),
+            ]
+        ]
+    )
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+async def download_file_bytes(bot: Bot, file_id: str) -> bytes:
+    tg_file = await bot.get_file(file_id)
+    if not tg_file.file_path:
+        raise RuntimeError("Telegram did not return file_path")
+    buffer = BytesIO()
+    await bot.download_file(tg_file.file_path, destination=buffer)
+    return buffer.getvalue()
+
+
+def compute_photo_phash(data: bytes) -> str:
+    with Image.open(BytesIO(data)) as img:
+        img = img.convert("RGB")
+        return str(imagehash.phash(img))
+
+
+def _frame_to_hash(frame) -> str:
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image = Image.fromarray(rgb)
+    return str(imagehash.phash(image))
+
+
+def compute_video_hashes(data: bytes) -> list[str]:
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
+        tmp.write(data)
+        tmp.flush()
+
+        cap = cv2.VideoCapture(tmp.name)
+        if not cap.isOpened():
+            raise RuntimeError("Failed to open video")
+
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if frame_count <= 0:
+            cap.release()
+            raise RuntimeError("Video contains no readable frames")
+
+        targets = sorted(
+            {
+                max(0, int(frame_count * 0.2) - 1),
+                max(0, int(frame_count * 0.5) - 1),
+                max(0, int(frame_count * 0.8) - 1),
+            }
+        )
+
+        hashes: list[str] = []
+        for idx in targets:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                hashes.append(_frame_to_hash(frame))
+
+        cap.release()
+
+        if not hashes:
+            raise RuntimeError("Could not extract frames from video")
+        return hashes
+
+
+async def get_media_meta(bot: Bot, message: Message) -> MediaMeta:
+    media_type, media = extract_media_handle(message)
+    if not media_type or not media:
+        raise ValueError("Message does not contain supported media")
+
+    raw = await download_file_bytes(bot, media.file_id)
+    digest = sha256_hex(raw)
+
+    if media_type == "photo":
+        return MediaMeta(
+            media_type="photo",
+            file_id=media.file_id,
+            file_unique_id=media.file_unique_id,
+            sha256=digest,
+            phash=compute_photo_phash(raw),
+        )
+
+    return MediaMeta(
+        media_type="video",
+        file_id=media.file_id,
+        file_unique_id=media.file_unique_id,
+        sha256=digest,
+        frame_hashes=compute_video_hashes(raw),
+    )
+
+
+def hash_distance(a: str, b: str) -> int:
+    return imagehash.hex_to_hash(a) - imagehash.hex_to_hash(b)
+
+
+async def ensure_indexes() -> None:
+    await items.create_index("file_unique_id", unique=True, sparse=True)
+    await items.create_index("sha256", unique=True, sparse=True)
+    await items.create_index("media_type")
+    await items.create_index("normalized_name")
+    await items.create_index("created_at")
+    await approved_users.create_index("user_id", unique=True)
+    await sudo_users.create_index("user_id", unique=True)
+    await known_users.create_index("user_id", unique=True)
+    await known_users.create_index("username")
+
+
+async def remember_user(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    await known_users.update_one(
+        {"user_id": user.id},
+        {
+            "$set": {
+                "user_id": user.id,
+                "username": (user.username or "").lower(),
+                "full_name": clean_value(user.full_name),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def is_sudo_user(user_id: Optional[int]) -> bool:
+    if not user_id:
+        return False
+    return await sudo_users.find_one({"user_id": user_id}) is not None
+
+
+async def is_approved_user(user_id: Optional[int]) -> bool:
+    if not user_id:
+        return False
+    return await approved_users.find_one({"user_id": user_id}) is not None
+
+
+async def is_allowed_user(message: Message) -> bool:
+    user_id = message.from_user.id if message.from_user else None
+    if not user_id:
+        return False
+    if user_id in OWNER_IDS:
+        return True
+    if await is_sudo_user(user_id):
+        return True
+    if await is_approved_user(user_id):
+        return True
+    return False
+
+
+async def can_save(message: Message) -> bool:
+    user_id = message.from_user.id if message.from_user else None
+    if not user_id:
+        return False
+    if user_id in OWNER_IDS:
+        return True
+    return await is_sudo_user(user_id)
+
+
+async def require_access(message: Message) -> bool:
+    if await is_allowed_user(message):
+        return True
+    await message.reply(
+        "ဒီ bot ကိုသုံးဖို့ owner approval လိုပါတယ်။\n"
+        "owner က /approve နဲ့ approve လုပ်ပြီးမှ သုံးလို့ရပါမယ်။"
+    )
+    return False
+
+
+async def find_match(meta: MediaMeta) -> Optional[dict[str, Any]]:
+    exact = await items.find_one({"file_unique_id": meta.file_unique_id})
+    if exact:
+        exact["match_reason"] = "file_unique_id"
+        return exact
+
+    exact = await items.find_one({"sha256": meta.sha256})
+    if exact:
+        exact["match_reason"] = "sha256"
+        return exact
+
+    if meta.media_type == "photo" and meta.phash:
+        best_item = None
+        best_score = 10**9
+        cursor = items.find({"media_type": "photo", "phash": {"$exists": True, "$ne": None}})
+        async for row in cursor:
+            distance = hash_distance(meta.phash, row["phash"])
+            if distance < best_score:
+                best_score = distance
+                best_item = row
+        if best_item and best_score <= PHOTO_PHASH_THRESHOLD:
+            best_item["match_reason"] = f"phash:{best_score}"
+            return best_item
+
+    if meta.media_type == "video" and meta.frame_hashes:
+        best_item = None
+        best_avg = 10**9
+        cursor = items.find({"media_type": "video", "frame_hashes": {"$exists": True, "$ne": []}})
+        async for row in cursor:
+            saved_hashes = row.get("frame_hashes") or []
+            if not saved_hashes:
+                continue
+            distances = [hash_distance(a, b) for a, b in zip(meta.frame_hashes, saved_hashes)]
+            if not distances:
+                continue
+            avg = sum(distances) / len(distances)
+            peak = max(distances)
+            if avg < best_avg and peak <= VIDEO_FRAME_THRESHOLD:
+                best_avg = avg
+                best_item = row
+        if best_item and best_avg <= VIDEO_AVG_THRESHOLD:
+            best_item["match_reason"] = f"video_hash:{best_avg:.2f}"
+            return best_item
+
+    return None
+
+
+async def upsert_item(*, meta: MediaMeta, parsed: ParsedText, saved_by: int) -> tuple[dict[str, Any], bool]:
+    command_name = clean_command_name(parsed.command_name or DEFAULT_COMMAND)
+    doc = {
+        "name": clean_value(parsed.name or ""),
+        "normalized_name": normalize_name(parsed.name or ""),
+        "anime_name": clean_value(parsed.anime_name or ""),
+        "rarity": clean_value(parsed.rarity or ""),
+        "card_id": clean_value(parsed.card_id or ""),
+        "command_name": command_name,
+        "raw_text": parsed.raw_text,
+        "media_type": meta.media_type,
+        "file_id": meta.file_id,
+        "file_unique_id": meta.file_unique_id,
+        "sha256": meta.sha256,
+        "phash": meta.phash,
+        "frame_hashes": meta.frame_hashes,
+        "saved_by": saved_by,
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    existing = await items.find_one(
+        {"$or": [{"file_unique_id": meta.file_unique_id}, {"sha256": meta.sha256}]}
+    )
+
+    if existing:
+        await items.update_one({"_id": existing["_id"]}, {"$set": doc})
+        existing.update(doc)
+        return existing, False
+
+    doc["created_at"] = datetime.now(timezone.utc)
+    result = await items.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return doc, True
+
+
+async def send_found_result(message: Message, item: dict[str, Any]) -> None:
+    name = clean_value(item.get("name") or "Unknown")
+    command_name = clean_command_name(item.get("command_name") or DEFAULT_COMMAND)
+    text = build_result_text(item)
+    keyboard = build_copy_keyboard(command_name, name)
+    await message.reply(text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
+
+
+async def send_not_found(message: Message) -> None:
+    await message.reply(
+        "မတွေ့သေးပါဘူး။\n"
+        "ဒီ media ကို owner/sudo က save မလုပ်ရသေးတာ ဖြစ်နိုင်ပါတယ်။"
+    )
+
+
+async def resolve_user_reference(message: Message, bot: Bot, raw_arg: Optional[str]) -> Optional[dict[str, Any]]:
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target = message.reply_to_message.from_user
+        return {
+            "user_id": target.id,
+            "username": (target.username or "").lower(),
+            "full_name": clean_value(target.full_name),
+        }
+
+    arg = clean_value(raw_arg or "")
+    if not arg:
+        return None
+
+    if arg.isdigit():
+        known = await known_users.find_one({"user_id": int(arg)})
+        return known or {"user_id": int(arg), "username": "", "full_name": ""}
+
+    if arg.startswith("@"):
+        username = arg.lstrip("@").lower()
+        known = await known_users.find_one({"username": username})
+        if known:
+            return known
+        try:
+            chat = await bot.get_chat(arg)
+            return {
+                "user_id": chat.id,
+                "username": (getattr(chat, "username", "") or "").lower(),
+                "full_name": clean_value(getattr(chat, "full_name", "") or ""),
+            }
+        except Exception:
+            return None
+
+    return None
+
+
+def format_target_user(user_doc: dict[str, Any]) -> str:
+    username = user_doc.get("username") or ""
+    user_id = user_doc.get("user_id")
+    full_name = clean_value(user_doc.get("full_name") or "")
+    if username:
+        return f"@{username} ({user_id})"
+    if full_name:
+        return f"{full_name} ({user_id})"
+    return str(user_id)
+
+
+async def set_access(collection, user_doc: dict[str, Any], added_by: int, enabled: bool) -> None:
+    if enabled:
+        await collection.update_one(
+            {"user_id": user_doc["user_id"]},
+            {
+                "$set": {
+                    "user_id": user_doc["user_id"],
+                    "username": user_doc.get("username", ""),
+                    "full_name": user_doc.get("full_name", ""),
+                    "updated_at": datetime.now(timezone.utc),
+                    "updated_by": added_by,
+                }
+            },
+            upsert=True,
+        )
+    else:
+        await collection.delete_one({"user_id": user_doc["user_id"]})
+
+
+# -----------------------------------------------------
+# Commands
+# -----------------------------------------------------
+@router.message(Command("start"))
+async def start_handler(message: Message) -> None:
+    await remember_user(message)
+    if await is_allowed_user(message):
+        await message.reply(
+            "ဒီ bot က photo/video post တွေကို match စစ်ပြီး name ပြန်ထုတ်ပေးပါတယ်။\n\n"
+            "• Approved user: media ကို forward / upload လုပ်တာနဲ့ auto lookup လုပ်ပေးမယ်\n"
+            "• Owner/Sudo: forwarded media ကို save လည်း လုပ်လို့ရပါတယ်"
+        )
+        return
+
+    await message.reply(
+        "ဒီ bot ကိုသုံးဖို့ approval လိုပါတယ်။\n"
+        "owner ကို userID / username ပေးပြီး approve လုပ်ခိုင်းပါ။"
+    )
+
+
+@router.message(Command("stats"))
+async def stats_handler(message: Message) -> None:
+    await remember_user(message)
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
+        return
+
+    total = await items.count_documents({})
+    photos = await items.count_documents({"media_type": "photo"})
+    videos = await items.count_documents({"media_type": "video"})
+    approved = await approved_users.count_documents({})
+    sudos = await sudo_users.count_documents({})
+    await message.reply(
+        f"Total saved: <b>{total}</b>\n"
+        f"Photos: <b>{photos}</b>\n"
+        f"Videos: <b>{videos}</b>\n"
+        f"Approved users: <b>{approved}</b>\n"
+        f"Sudo users: <b>{sudos}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("approve"))
+async def approve_handler(message: Message, command: CommandObject, bot: Bot) -> None:
+    await remember_user(message)
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
+        return
+
+    target = await resolve_user_reference(message, bot, command.args)
+    if not target:
+        await message.reply("အသုံးပြုပုံ:\nReply + /approve\n/approve @username\n/approve 123456789")
+        return
+
+    await set_access(approved_users, target, message.from_user.id, True)
+    await message.reply(f"Approved: <b>{html_escape(format_target_user(target))}</b>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("addsudo"))
+async def addsudo_handler(message: Message, command: CommandObject, bot: Bot) -> None:
+    await remember_user(message)
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
+        return
+
+    target = await resolve_user_reference(message, bot, command.args)
+    if not target:
+        await message.reply("အသုံးပြုပုံ:\nReply + /addsudo\n/addsudo @username\n/addsudo 123456789")
+        return
+
+    await set_access(sudo_users, target, message.from_user.id, True)
+    await set_access(approved_users, target, message.from_user.id, True)
+    await message.reply(f"Sudo added: <b>{html_escape(format_target_user(target))}</b>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("rmsudo"))
+async def rmsudo_handler(message: Message, command: CommandObject, bot: Bot) -> None:
+    await remember_user(message)
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
+        return
+
+    target = await resolve_user_reference(message, bot, command.args)
+    if not target:
+        await message.reply("အသုံးပြုပုံ:\nReply + /rmsudo\n/rmsudo @username\n/rmsudo 123456789")
+        return
+
+    await set_access(sudo_users, target, message.from_user.id, False)
+    await message.reply(f"Sudo removed: <b>{html_escape(format_target_user(target))}</b>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("save"))
+async def save_handler(message: Message, command: CommandObject, bot: Bot) -> None:
+    await remember_user(message)
+    if not await can_save(message):
+        return
+
+    target = message.reply_to_message or message
+    media_type, _media = extract_media_handle(target)
+    if not media_type:
+        await message.reply("/save ကို media message ကို reply ပြီးသုံးပါ")
+        return
+
+    parsed = parse_caption_text(get_message_text(target))
+    if command.args:
+        parsed.name = clean_value(command.args)
+
+    if not parsed.name:
+        await message.reply("name မတွေ့ပါ။\nအသုံးပြုပုံ: replied media ပေါ်မှာ /save Nahida")
+        return
+
+    try:
+        meta = await get_media_meta(bot, target)
+        doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=message.from_user.id)
+    except Exception as exc:
+        logger.exception("save failed")
+        await message.reply(f"save မအောင်မြင်ပါ: {exc}")
+        return
+
+    status = "Saved" if created else "Updated"
+    await message.reply(
+        f"{status}: <b>{html_escape(doc['name'])}</b>\n"
+        f"Type: <b>{doc['media_type']}</b>\n"
+        f"Cmd: <code>{html_escape(doc['command_name'])}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# -----------------------------------------------------
+# Media messages
+# -----------------------------------------------------
+@router.message(F.photo | F.video)
+async def media_handler(message: Message, bot: Bot) -> None:
+    await remember_user(message)
+
+    media_type, _media = extract_media_handle(message)
+    if not media_type:
+        return
+
+    user_can_use = await is_allowed_user(message)
+    user_can_save = await can_save(message)
+    text = get_message_text(message)
+    parsed = parse_caption_text(text)
+
+    if user_can_save and OWNER_AUTOSAVE_FORWARDS and parsed.name:
+        try:
+            meta = await get_media_meta(bot, message)
+            doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=message.from_user.id)
+            status = "Saved" if created else "Updated"
+            await message.reply(
+                f"{status}: <b>{html_escape(doc['name'])}</b>\n"
+                f"Mode: <b>auto-save</b>\n"
+                f"Cmd: <code>{html_escape(doc['command_name'])}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception:
+            logger.exception("auto-save failed; falling back to lookup")
+
+    if not user_can_use:
+        await require_access(message)
+        return
+
+    try:
+        meta = await get_media_meta(bot, message)
+        matched = await find_match(meta)
+        if matched:
+            await send_found_result(message, matched)
+        else:
+            await send_not_found(message)
+    except Exception as exc:
+        logger.exception("lookup failed")
+        await message.reply(f"စစ်ဆေးရာမှာ error ဖြစ်ပါတယ်: {exc}")
+
+
+# -----------------------------------------------------
+# Main
+# -----------------------------------------------------
+async def on_startup(bot: Bot) -> None:
+    await ensure_indexes()
+    me = await bot.get_me()
+    logger.info("Bot started as @%s", me.username)
+
+
+async def main() -> None:
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    dp.include_router(router)
+    await on_startup(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped")
