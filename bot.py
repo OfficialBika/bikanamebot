@@ -113,10 +113,9 @@ CARD_ID_PATTERNS = [
 ]
 
 COMMAND_PATTERNS = [
-    re.compile(r"(?:using|use|hint|full)\s*:?\s*(/[A-Za-z0-9_]+)\b", re.IGNORECASE),
-    re.compile(r"\b(/[A-Za-z0-9_]+)\s*\[[^\]]*name[^\]]*\]", re.IGNORECASE),
-    re.compile(r"\b(/[A-Za-z0-9_]+)\s*\([^\)]*name[^\)]*\)", re.IGNORECASE),
-    re.compile(r"\b(/[A-Za-z0-9_]+)\s+[\w\[\]ɴᴀᴍᴇNAMEname_\-]+", re.IGNORECASE),
+    re.compile(r"(?:using|use|hint|full).*?/\s*([A-Za-z0-9_]+)\b", re.IGNORECASE | re.DOTALL),
+    re.compile(r"/\s*([A-Za-z0-9_]+)\s*(?:\[[^\]]*name[^\]]*\]|\([^\)]*name[^\)]*\)|\bname\b)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"/\s*([A-Za-z0-9_]+)\b", re.IGNORECASE),
 ]
 
 NAME_TRIGGER_RE = re.compile(r"^(?:\.name|/name)(?:@\w+)?$", re.IGNORECASE)
@@ -184,12 +183,14 @@ def clean_command_name(value: str) -> str:
 
 
 def parse_command_name(text: str) -> Optional[str]:
-    raw = text or ""
+    raw = unicodedata.normalize("NFKC", normalize_parse_text(text or ""))
+
     for pattern in COMMAND_PATTERNS:
         match = pattern.search(raw)
         if match:
-            return clean_command_name(match.group(1))
-    return None
+            return clean_command_name("/" + match.group(1))
+
+    return None 
 
 
 def parse_caption_text(text: Optional[str]) -> ParsedText:
@@ -693,9 +694,10 @@ async def send_found_result(
     override_command_name: Optional[str] = None,
 ) -> None:
     name = clean_value(item.get("name") or "Unknown")
-    command_name = clean_command_name(
-        override_command_name or item.get("command_name") or DEFAULT_COMMAND
-    )
+
+    #nodbcmd
+    command_name = clean_command_name(override_command_name or DEFAULT_COMMAND)
+
     text = build_result_text(item, command_name=command_name)
     keyboard = build_copy_keyboard(command_name, name)
     await message.reply(
@@ -704,7 +706,6 @@ async def send_found_result(
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
-
 
 async def send_not_found(message: Message) -> None:
     await message.reply(
