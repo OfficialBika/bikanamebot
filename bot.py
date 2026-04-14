@@ -91,23 +91,23 @@ user_modes = db.user_modes
 # Helpers
 # -----------------------------------------------------
 NAME_PATTERNS = [
-    re.compile(r"^[^\n\r]*?Character\s*Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^[^\n\r]*?NAME\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^[^\n\r]*?Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Character\s*Name\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?\bNAME\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?\bName\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 ANIME_PATTERNS = [
-    re.compile(r"^[^\n\r]*?Anime\s*Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^[^\n\r]*?Anime\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Anime\s*Name\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Anime\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 RARITY_PATTERNS = [
-    re.compile(r"^[^\n\r]*?Rarity\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Rarity\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 CARD_ID_PATTERNS = [
-    re.compile(r"^[^\n\r]*?ID\s*:\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^[^\n\r]*?Id\s*:\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?ID\s*[:：﹕꞉]\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Id\s*[:：﹕꞉]\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 COMMAND_PATTERNS = [
@@ -116,6 +116,8 @@ COMMAND_PATTERNS = [
     re.compile(r"\b(/[A-Za-z0-9_]+)\s*\([^\)]*name[^\)]*\)", re.IGNORECASE),
     re.compile(r"\b(/[A-Za-z0-9_]+)\s+[\w\[\]ɴᴀᴍᴇNAMEname_\-]+", re.IGNORECASE),
 ]
+
+NAME_TRIGGER_RE = re.compile(r"^(?:\.name|/name)(?:@\w+)?$", re.IGNORECASE)
 
 router = Router()
 
@@ -152,6 +154,15 @@ def normalize_name(name: str) -> str:
     return clean_value(name).casefold()
 
 
+def normalize_parse_text(text: Optional[str]) -> str:
+    text = text or ""
+    text = text.replace("\r", "\n")
+    text = text.replace("：", ":").replace("﹕", ":").replace("꞉", ":")
+    text = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
+
+
 def parse_field(text: str, patterns: list[re.Pattern]) -> Optional[str]:
     for pattern in patterns:
         match = pattern.search(text or "")
@@ -179,7 +190,7 @@ def parse_command_name(text: str) -> Optional[str]:
 
 
 def parse_caption_text(text: Optional[str]) -> ParsedText:
-    raw = text or ""
+    raw = normalize_parse_text(text)
     return ParsedText(
         name=parse_field(raw, NAME_PATTERNS),
         anime_name=parse_field(raw, ANIME_PATTERNS),
@@ -190,15 +201,47 @@ def parse_caption_text(text: Optional[str]) -> ParsedText:
     )
 
 
+def collect_candidate_texts(message: Message) -> list[str]:
+    candidates: list[str] = []
+
+    for value in [
+        getattr(message, "caption", None),
+        getattr(message, "text", None),
+    ]:
+        value = normalize_parse_text(value)
+        if value and value not in candidates:
+            candidates.append(value)
+
+    ext = getattr(message, "external_reply", None)
+    if ext is not None:
+        for value in [
+            getattr(ext, "caption", None),
+            getattr(ext, "text", None),
+        ]:
+            value = normalize_parse_text(value)
+            if value and value not in candidates:
+                candidates.append(value)
+
+    return candidates
+
+
+def parse_caption_text_from_message(message: Message) -> ParsedText:
+    candidates = collect_candidate_texts(message)
+
+    for raw in candidates:
+        parsed = parse_caption_text(raw)
+        if parsed.name:
+            return parsed
+
+    raw = candidates[0] if candidates else ""
+    return parse_caption_text(raw)
+
+
 def get_hint_name(full_name: str) -> str:
     name = clean_value(full_name)
     if not name:
         return ""
     return name.split(" ")[0]
-
-
-def get_message_text(message: Message) -> str:
-    return message.caption or message.text or ""
 
 
 def extract_media_handle(message: Message):
@@ -209,6 +252,14 @@ def extract_media_handle(message: Message):
     return None, None
 
 
+def is_group_chat(message: Message) -> bool:
+    return bool(message.chat and getattr(message.chat, "type", "") in {"group", "supergroup"})
+
+
+def is_private_chat(message: Message) -> bool:
+    return bool(message.chat and getattr(message.chat, "type", "") == "private")
+
+
 def powered_by_html() -> str:
     username = OWNER_USERNAME.strip().lstrip("@")
     if not username:
@@ -216,9 +267,9 @@ def powered_by_html() -> str:
     return f'Powered by <a href="https://t.me/{html_escape(username)}">Official Bika</a>.'
 
 
-def build_result_text(item: dict[str, Any]) -> str:
+def build_result_text(item: dict[str, Any], command_name: Optional[str] = None) -> str:
     name = clean_value(item.get("name") or "Unknown")
-    command_name = clean_command_name(item.get("command_name") or DEFAULT_COMMAND)
+    command_name = clean_command_name(command_name or item.get("command_name") or DEFAULT_COMMAND)
     hint_name = get_hint_name(name)
 
     lines = [
@@ -340,10 +391,6 @@ async def get_media_meta(bot: Bot, message: Message) -> MediaMeta:
 
 def hash_distance(a: str, b: str) -> int:
     return imagehash.hex_to_hash(a) - imagehash.hex_to_hash(b)
-
-
-def is_private_chat(message: Message) -> bool:
-    return bool(message.chat and getattr(message.chat, "type", "") == "private")
 
 
 def is_forwarded_message(message: Message) -> bool:
@@ -604,10 +651,16 @@ async def upsert_item(*, meta: MediaMeta, parsed: ParsedText, saved_by: int) -> 
     return doc, True
 
 
-async def send_found_result(message: Message, item: dict[str, Any]) -> None:
+async def send_found_result(
+    message: Message,
+    item: dict[str, Any],
+    override_command_name: Optional[str] = None,
+) -> None:
     name = clean_value(item.get("name") or "Unknown")
-    command_name = clean_command_name(item.get("command_name") or DEFAULT_COMMAND)
-    text = build_result_text(item)
+    command_name = clean_command_name(
+        override_command_name or item.get("command_name") or DEFAULT_COMMAND
+    )
+    text = build_result_text(item, command_name=command_name)
     keyboard = build_copy_keyboard(command_name, name)
     await message.reply(
         text,
@@ -622,6 +675,20 @@ async def send_not_found(message: Message) -> None:
         "မတွေ့သေးပါဘူး။\n"
         "ဒီ media ကို owner/sudo က save မလုပ်ရသေးတာ ဖြစ်နိုင်ပါတယ်။"
     )
+
+
+async def lookup_and_reply(
+    reply_message: Message,
+    target_media_message: Message,
+    bot: Bot,
+    override_command_name: Optional[str] = None,
+) -> None:
+    meta = await get_media_meta(bot, target_media_message)
+    matched = await find_match(meta)
+    if matched:
+        await send_found_result(reply_message, matched, override_command_name=override_command_name)
+    else:
+        await send_not_found(reply_message)
 
 
 async def resolve_user_reference(message: Message, bot: Bot, raw_arg: Optional[str]) -> Optional[dict[str, Any]]:
@@ -697,16 +764,17 @@ async def start_handler(message: Message) -> None:
     await remember_user(message)
     if await is_allowed_user(message):
         await message.reply(
-            "ဒီ bot က photo/video post တွေကို match စစ်ပြီး name ပြန်ထုတ်ပေးပါတယ်။\n\n"
+            "ဒီ bot က photo/video post တွေကို match စစ်ပြီး name ပြန်ထုတ်ပေးပါတယ်。\n\n"
             "• Approved user: media ကို forward / upload လုပ်တာနဲ့ lookup လုပ်ပေးမယ်\n"
-            "• Owner/Sudo: DM ထဲ /autosave on လုပ်ပြီး allowed source channel post တွေကို save/update လုပ်လို့ရမယ်\n"
-            "• Owner/Sudo: /save နဲ့ manual save လည်း လုပ်လို့ရပါတယ်"
+            "• Group: media ကို reply ထောက်ပြီး .name or /name နဲ့မေးလို့ရမယ်\n"
+            "• Owner/Sudo: DM ထဲ /autosave on လုပ်ပြီး New post တွေကို Name save/update လုပ်လို့ရမယ်\n"
+            "• Owner/Sudo: /save နဲ့ ပုံ+Name ကို manual save လည်း လုပ်လို့ရပါတယ်"
         )
         return
 
     await message.reply(
-        "ဒီ bot ကိုသုံးဖို့ approval လိုပါတယ်။\n"
-        "owner ကို userID / username ပေးပြီး approve လုပ်ခိုင်းပါ။"
+        "ဒီ bot ကိုသုံးဖို့ approval လိုပါတယ်。\n"
+        "Owner ကို Collector level 1 card ပေးပြီး approve လုပ်ခိုင်းပါ။"
     )
 
 
@@ -834,12 +902,12 @@ async def save_handler(message: Message, command: CommandObject, bot: Bot) -> No
         await message.reply("/save ကို media message ကို reply ပြီးသုံးပါ")
         return
 
-    parsed = parse_caption_text(get_message_text(target))
+    parsed = parse_caption_text_from_message(target)
     if command.args:
         parsed.name = clean_value(command.args)
 
     if not parsed.name:
-        await message.reply("name မတွေ့ပါ။\nအသုံးပြုပုံ: replied media ပေါ်မှာ /save Nahida")
+        await message.reply("name မတွေ့ပါ。\nအသုံးပြုပုံ: replied media ပေါ်မှာ /save Nahida")
         return
 
     try:
@@ -859,6 +927,34 @@ async def save_handler(message: Message, command: CommandObject, bot: Bot) -> No
     )
 
 
+@router.message(F.text.regexp(NAME_TRIGGER_RE))
+async def name_trigger_handler(message: Message, bot: Bot) -> None:
+    await remember_user(message)
+
+    if not await is_allowed_user(message):
+        await require_access(message)
+        return
+
+    target = message.reply_to_message
+    if not target:
+        await message.reply("media message ကို reply ထောက်ပြီး .name သို့ /name သုံးပါ")
+        return
+
+    media_type, _media = extract_media_handle(target)
+    if not media_type:
+        await message.reply("photo/video message ကို reply ထောက်ပြီး .name သို့ /name သုံးပါ")
+        return
+
+    parsed_target = parse_caption_text_from_message(target)
+    override_cmd = parsed_target.command_name
+
+    try:
+        await lookup_and_reply(message, target, bot, override_command_name=override_cmd)
+    except Exception as exc:
+        logger.exception("reply lookup failed")
+        await message.reply(f"စစ်ဆေးရာမှာ error ဖြစ်နေပါတယ်: {exc}")
+
+
 # -----------------------------------------------------
 # Media messages
 # -----------------------------------------------------
@@ -875,10 +971,9 @@ async def media_handler(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id if message.from_user else None
     autosave_enabled = await get_autosave_mode(user_id)
 
-    text = get_message_text(message)
-    parsed = parse_caption_text(text)
+    parsed = parse_caption_text_from_message(message)
 
-    # Autosave mode: DM + owner/sudo + /autosave on + forwarded message only
+    # DM autosave mode: owner/sudo + /autosave on + forwarded message only
     if is_private_chat(message) and user_can_save and autosave_enabled and is_forwarded_message(message):
         if not is_allowed_forward_source(message):
             await message.reply("ဒီ forwarded source ကို auto-save ခွင့်မပြုထားသေးပါဘူး။")
@@ -918,15 +1013,11 @@ async def media_handler(message: Message, bot: Bot) -> None:
         return
 
     try:
-        meta = await get_media_meta(bot, message)
-        matched = await find_match(meta)
-        if matched:
-            await send_found_result(message, matched)
-        else:
-            await send_not_found(message)
+        override_cmd = parsed.command_name
+        await lookup_and_reply(message, message, bot, override_command_name=override_cmd)
     except Exception as exc:
         logger.exception("lookup failed")
-        await message.reply(f"စစ်ဆေးရာမှာ error ဖြစ်ပါတယ်: {exc}")
+        await message.reply(f"စစ်ဆေးရာမှာ error ဖြစ်နေပါတယ်: {exc}")
 
 
 # -----------------------------------------------------
