@@ -543,7 +543,7 @@ async def require_access(message: Message) -> bool:
         return True
     await message.reply(
         "ဒီ bot ကိုသုံးဖို့ owner approval လိုပါတယ်။\n"
-        "owner က /approve နဲ့ approve လုပ်ပြီးမှ သုံးလို့ရပါမယ်။"
+        "Owner ကို Ledengary 1 card ပေးပြီးမှ သုံးလို့ရပါမယ်။"
     )
     return False
 
@@ -672,8 +672,8 @@ async def send_found_result(
 
 async def send_not_found(message: Message) -> None:
     await message.reply(
-        "မတွေ့သေးပါဘူး။\n"
-        "ဒီ media ကို owner/sudo က save မလုပ်ရသေးတာ ဖြစ်နိုင်ပါတယ်။"
+        "Unknown!\n"
+        "ဒီ Media Name ကို owner က save မလုပ်ရသေးတာ ဖြစ်နိုင်ပါတယ်။"
     )
 
 
@@ -774,7 +774,7 @@ async def start_handler(message: Message) -> None:
 
     await message.reply(
         "ဒီ bot ကိုသုံးဖို့ approval လိုပါတယ်。\n"
-        "Owner ကို Collector level 1 card ပေးပြီး approve လုပ်ခိုင်းပါ။"
+        "Owner ကို Legendary 1 card ပေးပြီး approve လုပ်ခိုင်းပါ။"
     )
 
 
