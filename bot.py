@@ -86,6 +86,7 @@ approved_users = db.approved_users
 sudo_users = db.sudo_users
 known_users = db.known_users
 user_modes = db.user_modes
+settings_col = db.settings
 
 # -----------------------------------------------------
 # Helpers
@@ -484,6 +485,7 @@ async def ensure_indexes() -> None:
     await known_users.create_index("user_id", unique=True)
     await known_users.create_index("username")
     await user_modes.create_index("user_id", unique=True)
+    await settings_col.create_index("key", unique=True)
 
 
 async def remember_user(message: Message) -> None:
@@ -516,16 +518,43 @@ async def is_approved_user(user_id: Optional[int]) -> bool:
     return await approved_users.find_one({"user_id": user_id}) is not None
 
 
+async def set_global_mode(enabled: bool, updated_by: int) -> None:
+    await settings_col.update_one(
+        {"key": "global_mode"},
+        {
+            "$set": {
+                "key": "global_mode",
+                "enabled": enabled,
+                "updated_by": updated_by,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def get_global_mode() -> bool:
+    row = await settings_col.find_one({"key": "global_mode"})
+    return bool(row and row.get("enabled"))
+
+
 async def is_allowed_user(message: Message) -> bool:
     user_id = message.from_user.id if message.from_user else None
     if not user_id:
         return False
+
     if user_id in OWNER_IDS:
         return True
+
     if await is_sudo_user(user_id):
         return True
+
+    if await get_global_mode():
+        return True
+
     if await is_approved_user(user_id):
         return True
+
     return False
 
 
@@ -541,6 +570,11 @@ async def can_save(message: Message) -> bool:
 async def require_access(message: Message) -> bool:
     if await is_allowed_user(message):
         return True
+
+    global_mode = await get_global_mode()
+    if global_mode:
+        return True
+
     await message.reply(
         "ဒီ bot ကိုသုံးဖို့ owner approval လိုပါတယ်။\n"
         "Owner ကို Ledengary 1 card ပေးပြီးမှ သုံးလို့ရပါမယ်။"
@@ -772,9 +806,53 @@ async def start_handler(message: Message) -> None:
         )
         return
 
+    global_mode = await get_global_mode()
+    if global_mode:
+        await message.reply("Global mode ON ဖြစ်နေပါတယ်။ ဘယ်သူမဆို သုံးလို့ရပါတယ်။")
+        return
+
     await message.reply(
         "ဒီ bot ကိုသုံးဖို့ approval လိုပါတယ်。\n"
         "Owner ကို Legendary 1 card ပေးပြီး approve လုပ်ခိုင်းပါ။"
+    )
+
+
+@router.message(Command("global"))
+async def global_handler(message: Message, command: CommandObject) -> None:
+    await remember_user(message)
+
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
+        return
+
+    arg = clean_value(command.args or "").lower()
+
+    if arg not in {"on", "off", "status"}:
+        enabled = await get_global_mode()
+        await message.reply(
+            "အသုံးပြုပုံ:\n"
+            "/global on\n"
+            "/global off\n"
+            "/global status\n\n"
+            f"Current: <b>{'ON' if enabled else 'OFF'}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if arg == "status":
+        enabled = await get_global_mode()
+        await message.reply(
+            f"Global mode: <b>{'ON' if enabled else 'OFF'}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    enabled = arg == "on"
+    await set_global_mode(enabled, message.from_user.id)
+
+    await message.reply(
+        f"Global mode: <b>{'ON' if enabled else 'OFF'}</b>\n"
+        f"{'အခု ဘယ်သူမဆို bot ကို သုံးလို့ရပါပြီ။' if enabled else 'အခု approve ထားတဲ့သူတွေပဲ bot ကို သုံးလို့ရပါမယ်။'}",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -825,12 +903,15 @@ async def stats_handler(message: Message) -> None:
     videos = await items.count_documents({"media_type": "video"})
     approved = await approved_users.count_documents({})
     sudos = await sudo_users.count_documents({})
+    global_mode = await get_global_mode()
+
     await message.reply(
         f"Total saved: <b>{total}</b>\n"
         f"Photos: <b>{photos}</b>\n"
         f"Videos: <b>{videos}</b>\n"
         f"Approved users: <b>{approved}</b>\n"
-        f"Sudo users: <b>{sudos}</b>",
+        f"Sudo users: <b>{sudos}</b>\n"
+        f"Global mode: <b>{'ON' if global_mode else 'OFF'}</b>",
         parse_mode=ParseMode.HTML,
     )
 
