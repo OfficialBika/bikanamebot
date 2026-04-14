@@ -40,7 +40,6 @@ OWNER_IDS = {
     if x.strip().isdigit()
 }
 
-OWNER_AUTOSAVE_FORWARDS = os.getenv("OWNER_AUTOSAVE_FORWARDS", "true").lower() == "true"
 PHOTO_PHASH_THRESHOLD = int(os.getenv("PHOTO_PHASH_THRESHOLD", "8"))
 VIDEO_FRAME_THRESHOLD = int(os.getenv("VIDEO_FRAME_THRESHOLD", "10"))
 VIDEO_AVG_THRESHOLD = int(os.getenv("VIDEO_AVG_THRESHOLD", "12"))
@@ -48,7 +47,6 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "@Official_Bika").strip()
 DEFAULT_COMMAND = os.getenv("DEFAULT_COMMAND", "/hallow").strip() or "/hallow"
 
-# Auto-save source restrictions
 SOURCE_CHANNEL_IDS = {
     int(x.strip())
     for x in os.getenv("SOURCE_CHANNEL_IDS", "").split(",")
@@ -87,6 +85,7 @@ items = db.items
 approved_users = db.approved_users
 sudo_users = db.sudo_users
 known_users = db.known_users
+user_modes = db.user_modes
 
 # -----------------------------------------------------
 # Helpers
@@ -172,12 +171,10 @@ def clean_command_name(value: str) -> str:
 
 def parse_command_name(text: str) -> Optional[str]:
     raw = text or ""
-
     for pattern in COMMAND_PATTERNS:
         match = pattern.search(raw)
         if match:
             return clean_command_name(match.group(1))
-
     return None
 
 
@@ -345,16 +342,101 @@ def hash_distance(a: str, b: str) -> int:
     return imagehash.hex_to_hash(a) - imagehash.hex_to_hash(b)
 
 
+def is_private_chat(message: Message) -> bool:
+    return bool(message.chat and getattr(message.chat, "type", "") == "private")
+
+
+def is_forwarded_message(message: Message) -> bool:
+    return bool(
+        getattr(message, "forward_origin", None)
+        or getattr(message, "forward_from_chat", None)
+        or getattr(message, "forward_from", None)
+        or getattr(message, "forward_sender_name", None)
+    )
+
+
+def get_forward_source_info(message: Message) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "chat_id": None,
+        "username": "",
+        "title": "",
+        "origin_type": "",
+    }
+
+    origin = getattr(message, "forward_origin", None)
+    if origin:
+        info["origin_type"] = origin.__class__.__name__
+
+        chat = getattr(origin, "chat", None)
+        if chat is None:
+            sender_chat = getattr(origin, "sender_chat", None)
+            if sender_chat is not None:
+                chat = sender_chat
+
+        if chat is not None:
+            info["chat_id"] = getattr(chat, "id", None)
+            info["username"] = (getattr(chat, "username", "") or "").lower()
+            info["title"] = clean_value(getattr(chat, "title", "") or "").casefold()
+            return info
+
+        sender_user_name = (getattr(origin, "sender_user_name", "") or "").lower()
+        if sender_user_name:
+            info["username"] = sender_user_name
+            return info
+
+    legacy_chat = getattr(message, "forward_from_chat", None)
+    if legacy_chat is not None:
+        info["chat_id"] = getattr(legacy_chat, "id", None)
+        info["username"] = (getattr(legacy_chat, "username", "") or "").lower()
+        info["title"] = clean_value(getattr(legacy_chat, "title", "") or "").casefold()
+        info["origin_type"] = "legacy_forward_chat"
+        return info
+
+    sender_chat = getattr(message, "sender_chat", None)
+    if sender_chat is not None:
+        info["chat_id"] = getattr(sender_chat, "id", None)
+        info["username"] = (getattr(sender_chat, "username", "") or "").lower()
+        info["title"] = clean_value(getattr(sender_chat, "title", "") or "").casefold()
+        info["origin_type"] = "sender_chat"
+        return info
+
+    return info
+
+
+def is_allowed_forward_source(message: Message) -> bool:
+    if not is_forwarded_message(message):
+        return False
+
+    if not SOURCE_CHANNEL_IDS and not SOURCE_CHANNEL_USERNAMES and not SOURCE_CHANNEL_TITLES:
+        return True
+
+    info = get_forward_source_info(message)
+    chat_id = info.get("chat_id")
+    username = info.get("username", "")
+    title = info.get("title", "")
+
+    if chat_id is not None and chat_id in SOURCE_CHANNEL_IDS:
+        return True
+    if username and username in SOURCE_CHANNEL_USERNAMES:
+        return True
+    if title and title in SOURCE_CHANNEL_TITLES:
+        return True
+
+    return False
+
+
 async def ensure_indexes() -> None:
     await items.create_index("file_unique_id", unique=True, sparse=True)
     await items.create_index("sha256", unique=True, sparse=True)
     await items.create_index("media_type")
     await items.create_index("normalized_name")
     await items.create_index("created_at")
+
     await approved_users.create_index("user_id", unique=True)
     await sudo_users.create_index("user_id", unique=True)
     await known_users.create_index("user_id", unique=True)
     await known_users.create_index("username")
+    await user_modes.create_index("user_id", unique=True)
 
 
 async def remember_user(message: Message) -> None:
@@ -419,71 +501,25 @@ async def require_access(message: Message) -> bool:
     return False
 
 
-def is_forwarded_message(message: Message) -> bool:
-    return bool(
-        getattr(message, "forward_origin", None)
-        or getattr(message, "forward_from_chat", None)
-        or getattr(message, "forward_from", None)
-        or getattr(message, "forward_sender_name", None)
+async def set_autosave_mode(user_id: int, enabled: bool) -> None:
+    await user_modes.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "user_id": user_id,
+                "autosave_enabled": enabled,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
     )
 
 
-def get_forward_source_info(message: Message) -> dict[str, Any]:
-    info: dict[str, Any] = {
-        "chat_id": None,
-        "username": "",
-        "title": "",
-        "origin_type": "",
-    }
-
-    origin = getattr(message, "forward_origin", None)
-    if origin:
-        info["origin_type"] = origin.__class__.__name__
-
-        chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
-        if chat:
-            info["chat_id"] = getattr(chat, "id", None)
-            info["username"] = (getattr(chat, "username", "") or "").lower()
-            info["title"] = clean_value(getattr(chat, "title", "") or "").casefold()
-            return info
-
-        sender_user_name = (getattr(origin, "sender_user_name", "") or "").lower()
-        if sender_user_name:
-            info["username"] = sender_user_name
-            return info
-
-    legacy_chat = getattr(message, "forward_from_chat", None)
-    if legacy_chat:
-        info["chat_id"] = getattr(legacy_chat, "id", None)
-        info["username"] = (getattr(legacy_chat, "username", "") or "").lower()
-        info["title"] = clean_value(getattr(legacy_chat, "title", "") or "").casefold()
-        info["origin_type"] = "legacy_forward_chat"
-        return info
-
-    return info
-
-
-def is_allowed_forward_source(message: Message) -> bool:
-    if not is_forwarded_message(message):
+async def get_autosave_mode(user_id: Optional[int]) -> bool:
+    if not user_id:
         return False
-
-    # No source filters configured -> allow any forwarded source
-    if not SOURCE_CHANNEL_IDS and not SOURCE_CHANNEL_USERNAMES and not SOURCE_CHANNEL_TITLES:
-        return True
-
-    info = get_forward_source_info(message)
-    chat_id = info.get("chat_id")
-    username = info.get("username", "")
-    title = info.get("title", "")
-
-    if chat_id is not None and chat_id in SOURCE_CHANNEL_IDS:
-        return True
-    if username and username in SOURCE_CHANNEL_USERNAMES:
-        return True
-    if title and title in SOURCE_CHANNEL_TITLES:
-        return True
-
-    return False
+    row = await user_modes.find_one({"user_id": user_id})
+    return bool(row and row.get("autosave_enabled"))
 
 
 async def find_match(meta: MediaMeta) -> Optional[dict[str, Any]]:
@@ -662,8 +698,8 @@ async def start_handler(message: Message) -> None:
     if await is_allowed_user(message):
         await message.reply(
             "ဒီ bot က photo/video post တွေကို match စစ်ပြီး name ပြန်ထုတ်ပေးပါတယ်။\n\n"
-            "• Approved user: media ကို forward / upload လုပ်တာနဲ့ auto lookup လုပ်ပေးမယ်\n"
-            "• Owner/Sudo: allowed source channel က forwarded media ကို auto-save လုပ်ပေးမယ်\n"
+            "• Approved user: media ကို forward / upload လုပ်တာနဲ့ lookup လုပ်ပေးမယ်\n"
+            "• Owner/Sudo: DM ထဲ /autosave on လုပ်ပြီး allowed source channel post တွေကို save/update လုပ်လို့ရမယ်\n"
             "• Owner/Sudo: /save နဲ့ manual save လည်း လုပ်လို့ရပါတယ်"
         )
         return
@@ -671,6 +707,42 @@ async def start_handler(message: Message) -> None:
     await message.reply(
         "ဒီ bot ကိုသုံးဖို့ approval လိုပါတယ်။\n"
         "owner ကို userID / username ပေးပြီး approve လုပ်ခိုင်းပါ။"
+    )
+
+
+@router.message(Command("autosave"))
+async def autosave_handler(message: Message, command: CommandObject) -> None:
+    await remember_user(message)
+
+    if not is_private_chat(message):
+        await message.reply("ဒီ command ကို DM/private chat ထဲမှာပဲ သုံးပါ။")
+        return
+
+    if not await can_save(message):
+        return
+
+    arg = clean_value(command.args or "").lower()
+    if arg not in {"on", "off", "status"}:
+        await message.reply("အသုံးပြုပုံ:\n/autosave on\n/autosave off\n/autosave status")
+        return
+
+    user_id = message.from_user.id
+
+    if arg == "status":
+        enabled = await get_autosave_mode(user_id)
+        await message.reply(
+            f"Auto-save mode: <b>{'ON' if enabled else 'OFF'}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    enabled = arg == "on"
+    await set_autosave_mode(user_id, enabled)
+
+    await message.reply(
+        f"Auto-save mode: <b>{'ON' if enabled else 'OFF'}</b>\n"
+        f"{'Forwarded post တွေကို save/update ပဲလုပ်ပါမယ်။' if enabled else 'Normal lookup mode ပြန်ဝင်ပါပြီ။'}",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -707,7 +779,10 @@ async def approve_handler(message: Message, command: CommandObject, bot: Bot) ->
         return
 
     await set_access(approved_users, target, message.from_user.id, True)
-    await message.reply(f"Approved: <b>{html_escape(format_target_user(target))}</b>", parse_mode=ParseMode.HTML)
+    await message.reply(
+        f"Approved: <b>{html_escape(format_target_user(target))}</b>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(Command("addsudo"))
@@ -723,7 +798,10 @@ async def addsudo_handler(message: Message, command: CommandObject, bot: Bot) ->
 
     await set_access(sudo_users, target, message.from_user.id, True)
     await set_access(approved_users, target, message.from_user.id, True)
-    await message.reply(f"Sudo added: <b>{html_escape(format_target_user(target))}</b>", parse_mode=ParseMode.HTML)
+    await message.reply(
+        f"Sudo added: <b>{html_escape(format_target_user(target))}</b>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(Command("rmsudo"))
@@ -738,7 +816,10 @@ async def rmsudo_handler(message: Message, command: CommandObject, bot: Bot) -> 
         return
 
     await set_access(sudo_users, target, message.from_user.id, False)
-    await message.reply(f"Sudo removed: <b>{html_escape(format_target_user(target))}</b>", parse_mode=ParseMode.HTML)
+    await message.reply(
+        f"Sudo removed: <b>{html_escape(format_target_user(target))}</b>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(Command("save"))
@@ -791,35 +872,46 @@ async def media_handler(message: Message, bot: Bot) -> None:
 
     user_can_use = await is_allowed_user(message)
     user_can_save = await can_save(message)
+    user_id = message.from_user.id if message.from_user else None
+    autosave_enabled = await get_autosave_mode(user_id)
+
     text = get_message_text(message)
     parsed = parse_caption_text(text)
 
-    should_autosave = (
-        user_can_save
-        and OWNER_AUTOSAVE_FORWARDS
-        and parsed.name is not None
-        and is_allowed_forward_source(message)
-    )
+    # Autosave mode: DM + owner/sudo + /autosave on + forwarded message only
+    if is_private_chat(message) and user_can_save and autosave_enabled and is_forwarded_message(message):
+        if not is_allowed_forward_source(message):
+            await message.reply("ဒီ forwarded source ကို auto-save ခွင့်မပြုထားသေးပါဘူး။")
+            return
 
-    if should_autosave:
+        if not parsed.name:
+            await message.reply("name မတွေ့ပါ။ Character Name line ပါတဲ့ post ကို forward လုပ်ပါ။")
+            return
+
         try:
             meta = await get_media_meta(bot, message)
-            doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=message.from_user.id)
+            doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=user_id)
 
             status = "Saved" if created else "Updated"
             source_info = get_forward_source_info(message)
-            source_title = source_info.get("title") or source_info.get("username") or "forwarded source"
+            source_label = (
+                source_info.get("title")
+                or source_info.get("username")
+                or str(source_info.get("chat_id") or "forwarded source")
+            )
 
             await message.reply(
                 f"{status}: <b>{html_escape(doc['name'])}</b>\n"
                 f"Mode: <b>auto-save</b>\n"
-                f"Source: <b>{html_escape(source_title)}</b>\n"
+                f"Source: <b>{html_escape(str(source_label))}</b>\n"
                 f"Cmd: <code>{html_escape(doc['command_name'])}</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
-        except Exception:
-            logger.exception("auto-save failed; falling back to lookup")
+        except Exception as exc:
+            logger.exception("auto-save failed")
+            await message.reply(f"auto-save error: {exc}")
+            return
 
     if not user_can_use:
         await require_access(message)
