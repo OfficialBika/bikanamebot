@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import logging
+import unicodedata
 import os
 import re
 import tempfile
@@ -157,6 +158,7 @@ def normalize_name(name: str) -> str:
 
 def normalize_parse_text(text: Optional[str]) -> str:
     text = text or ""
+    text = unicodedata.normalize("NFKC", text)
     text = text.replace("\r", "\n")
     text = text.replace("：", ":").replace("﹕", ":").replace("꞉", ":")
     text = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", text)
