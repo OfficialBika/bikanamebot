@@ -33,11 +33,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
 DB_NAME = os.getenv("DB_NAME", "hallow_match_bot").strip()
+
 OWNER_IDS = {
     int(x.strip())
     for x in os.getenv("OWNER_IDS", os.getenv("OWNER_ID", "")).split(",")
     if x.strip().isdigit()
 }
+
 OWNER_AUTOSAVE_FORWARDS = os.getenv("OWNER_AUTOSAVE_FORWARDS", "true").lower() == "true"
 PHOTO_PHASH_THRESHOLD = int(os.getenv("PHOTO_PHASH_THRESHOLD", "8"))
 VIDEO_FRAME_THRESHOLD = int(os.getenv("VIDEO_FRAME_THRESHOLD", "10"))
@@ -45,6 +47,23 @@ VIDEO_AVG_THRESHOLD = int(os.getenv("VIDEO_AVG_THRESHOLD", "12"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "@Official_Bika").strip()
 DEFAULT_COMMAND = os.getenv("DEFAULT_COMMAND", "/hallow").strip() or "/hallow"
+
+# Auto-save source restrictions
+SOURCE_CHANNEL_IDS = {
+    int(x.strip())
+    for x in os.getenv("SOURCE_CHANNEL_IDS", "").split(",")
+    if x.strip() and re.fullmatch(r"-?\d+", x.strip())
+}
+SOURCE_CHANNEL_USERNAMES = {
+    x.strip().lstrip("@").lower()
+    for x in os.getenv("SOURCE_CHANNEL_USERNAMES", "").split(",")
+    if x.strip()
+}
+SOURCE_CHANNEL_TITLES = {
+    x.strip().casefold()
+    for x in os.getenv("SOURCE_CHANNEL_TITLES", "").split(",")
+    if x.strip()
+}
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -73,19 +92,23 @@ known_users = db.known_users
 # Helpers
 # -----------------------------------------------------
 NAME_PATTERNS = [
-    re.compile(r"^\s*Character\s*Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^\s*NAME\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^\s*Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Character\s*Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?NAME\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
+
 ANIME_PATTERNS = [
-    re.compile(r"^\s*Anime\s*Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^\s*Anime\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Anime\s*Name\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Anime\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
+
 RARITY_PATTERNS = [
-    re.compile(r"^\s*Rarity\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Rarity\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
+
 CARD_ID_PATTERNS = [
-    re.compile(r"^\s*ID\s*:\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?ID\s*:\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Id\s*:\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 COMMAND_PATTERNS = [
@@ -150,7 +173,6 @@ def clean_command_name(value: str) -> str:
 def parse_command_name(text: str) -> Optional[str]:
     raw = text or ""
 
-    # Prefer explicit [NAME] templates or hint/full sections.
     for pattern in COMMAND_PATTERNS:
         match = pattern.search(raw)
         if match:
@@ -397,6 +419,73 @@ async def require_access(message: Message) -> bool:
     return False
 
 
+def is_forwarded_message(message: Message) -> bool:
+    return bool(
+        getattr(message, "forward_origin", None)
+        or getattr(message, "forward_from_chat", None)
+        or getattr(message, "forward_from", None)
+        or getattr(message, "forward_sender_name", None)
+    )
+
+
+def get_forward_source_info(message: Message) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "chat_id": None,
+        "username": "",
+        "title": "",
+        "origin_type": "",
+    }
+
+    origin = getattr(message, "forward_origin", None)
+    if origin:
+        info["origin_type"] = origin.__class__.__name__
+
+        chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
+        if chat:
+            info["chat_id"] = getattr(chat, "id", None)
+            info["username"] = (getattr(chat, "username", "") or "").lower()
+            info["title"] = clean_value(getattr(chat, "title", "") or "").casefold()
+            return info
+
+        sender_user_name = (getattr(origin, "sender_user_name", "") or "").lower()
+        if sender_user_name:
+            info["username"] = sender_user_name
+            return info
+
+    legacy_chat = getattr(message, "forward_from_chat", None)
+    if legacy_chat:
+        info["chat_id"] = getattr(legacy_chat, "id", None)
+        info["username"] = (getattr(legacy_chat, "username", "") or "").lower()
+        info["title"] = clean_value(getattr(legacy_chat, "title", "") or "").casefold()
+        info["origin_type"] = "legacy_forward_chat"
+        return info
+
+    return info
+
+
+def is_allowed_forward_source(message: Message) -> bool:
+    if not is_forwarded_message(message):
+        return False
+
+    # No source filters configured -> allow any forwarded source
+    if not SOURCE_CHANNEL_IDS and not SOURCE_CHANNEL_USERNAMES and not SOURCE_CHANNEL_TITLES:
+        return True
+
+    info = get_forward_source_info(message)
+    chat_id = info.get("chat_id")
+    username = info.get("username", "")
+    title = info.get("title", "")
+
+    if chat_id is not None and chat_id in SOURCE_CHANNEL_IDS:
+        return True
+    if username and username in SOURCE_CHANNEL_USERNAMES:
+        return True
+    if title and title in SOURCE_CHANNEL_TITLES:
+        return True
+
+    return False
+
+
 async def find_match(meta: MediaMeta) -> Optional[dict[str, Any]]:
     exact = await items.find_one({"file_unique_id": meta.file_unique_id})
     if exact:
@@ -484,7 +573,12 @@ async def send_found_result(message: Message, item: dict[str, Any]) -> None:
     command_name = clean_command_name(item.get("command_name") or DEFAULT_COMMAND)
     text = build_result_text(item)
     keyboard = build_copy_keyboard(command_name, name)
-    await message.reply(text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
+    await message.reply(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
 
 
 async def send_not_found(message: Message) -> None:
@@ -569,7 +663,8 @@ async def start_handler(message: Message) -> None:
         await message.reply(
             "ဒီ bot က photo/video post တွေကို match စစ်ပြီး name ပြန်ထုတ်ပေးပါတယ်။\n\n"
             "• Approved user: media ကို forward / upload လုပ်တာနဲ့ auto lookup လုပ်ပေးမယ်\n"
-            "• Owner/Sudo: forwarded media ကို save လည်း လုပ်လို့ရပါတယ်"
+            "• Owner/Sudo: allowed source channel က forwarded media ကို auto-save လုပ်ပေးမယ်\n"
+            "• Owner/Sudo: /save နဲ့ manual save လည်း လုပ်လို့ရပါတယ်"
         )
         return
 
@@ -699,14 +794,26 @@ async def media_handler(message: Message, bot: Bot) -> None:
     text = get_message_text(message)
     parsed = parse_caption_text(text)
 
-    if user_can_save and OWNER_AUTOSAVE_FORWARDS and parsed.name:
+    should_autosave = (
+        user_can_save
+        and OWNER_AUTOSAVE_FORWARDS
+        and parsed.name is not None
+        and is_allowed_forward_source(message)
+    )
+
+    if should_autosave:
         try:
             meta = await get_media_meta(bot, message)
             doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=message.from_user.id)
+
             status = "Saved" if created else "Updated"
+            source_info = get_forward_source_info(message)
+            source_title = source_info.get("title") or source_info.get("username") or "forwarded source"
+
             await message.reply(
                 f"{status}: <b>{html_escape(doc['name'])}</b>\n"
                 f"Mode: <b>auto-save</b>\n"
+                f"Source: <b>{html_escape(source_title)}</b>\n"
                 f"Cmd: <code>{html_escape(doc['command_name'])}</code>",
                 parse_mode=ParseMode.HTML,
             )
@@ -737,6 +844,9 @@ async def on_startup(bot: Bot) -> None:
     await ensure_indexes()
     me = await bot.get_me()
     logger.info("Bot started as @%s", me.username)
+    logger.info("Configured source ids: %s", sorted(SOURCE_CHANNEL_IDS) if SOURCE_CHANNEL_IDS else "none")
+    logger.info("Configured source usernames: %s", sorted(SOURCE_CHANNEL_USERNAMES) if SOURCE_CHANNEL_USERNAMES else "none")
+    logger.info("Configured source titles: %s", sorted(SOURCE_CHANNEL_TITLES) if SOURCE_CHANNEL_TITLES else "none")
 
 
 async def main() -> None:
