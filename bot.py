@@ -289,7 +289,7 @@ def build_result_text(item: dict[str, Any], command_name: Optional[str] = None) 
     hint_name = get_hint_name(name)
 
     lines = [
-        f"<b>NAME :</b> {html_escape(name)}",
+        f"<b>NAME :</b> <code>{html_escape(f'{name}')}</code>",
         "────────────────",
         f"🔹 <b>Hint :</b> <code>{html_escape(f'{command_name} {hint_name}')}</code>",
         f"🔸 <b>Full :</b> <code>{html_escape(f'{command_name} {name}')}</code>",
