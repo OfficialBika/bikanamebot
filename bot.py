@@ -64,6 +64,12 @@ SOURCE_CHANNEL_TITLES = {
     if x.strip()
 }
 
+INLINE_SOURCE_BOTS = {
+    x.strip().lstrip("@").lower()
+    for x in os.getenv("INLINE_SOURCE_BOTS", "@Character_Catcher_Bot").split(",")
+    if x.strip()
+}
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 if not MONGO_URI:
@@ -119,6 +125,8 @@ COMMAND_PATTERNS = [
 ]
 
 NAME_TRIGGER_RE = re.compile(r"^(?:\.name|/name)(?:@\w+)?$", re.IGNORECASE)
+CHARACTER_CATCHER_HEADER_RE = re.compile(r"OwO!\s*Check out this character!", re.IGNORECASE)
+CHARACTER_CATCHER_NAME_RE = re.compile(r"^\s*(\d+)\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 
 router = Router()
 
@@ -190,7 +198,7 @@ def parse_command_name(text: str) -> Optional[str]:
         if match:
             return clean_command_name("/" + match.group(1))
 
-    return None 
+    return None
 
 
 def parse_caption_text(text: Optional[str]) -> ParsedText:
@@ -241,6 +249,10 @@ def parse_caption_text_from_message(message: Message) -> ParsedText:
     return parse_caption_text(raw)
 
 
+def get_combined_message_text(message: Message) -> str:
+    return "\n".join(collect_candidate_texts(message)).strip()
+
+
 def get_hint_name(full_name: str) -> str:
     name = clean_value(full_name)
     if not name:
@@ -273,7 +285,7 @@ def powered_by_html() -> str:
 
 def build_result_text(item: dict[str, Any], command_name: Optional[str] = None) -> str:
     name = clean_value(item.get("name") or "Unknown")
-    command_name = clean_command_name(command_name or item.get("command_name") or DEFAULT_COMMAND)
+    command_name = clean_command_name(command_name or DEFAULT_COMMAND)
     hint_name = get_hint_name(name)
 
     lines = [
@@ -474,6 +486,110 @@ def is_allowed_forward_source(message: Message) -> bool:
         return True
 
     return False
+
+
+def is_inline_source_bot(message: Message) -> bool:
+    via_bot = getattr(message, "via_bot", None)
+    if via_bot is None:
+        return False
+
+    username = (getattr(via_bot, "username", "") or "").lower()
+    if not username:
+        return False
+
+    return username in INLINE_SOURCE_BOTS
+
+
+def is_character_catcher_style_message(message: Message) -> bool:
+    raw = get_combined_message_text(message)
+    return bool(
+        raw
+        and CHARACTER_CATCHER_HEADER_RE.search(raw)
+        and CHARACTER_CATCHER_NAME_RE.search(raw)
+    )
+
+
+def is_character_catcher_source_message(message: Message) -> bool:
+    return is_inline_source_bot(message) or is_character_catcher_style_message(message)
+
+
+def is_hallow_forward_source_message(message: Message) -> bool:
+    return is_forwarded_message(message) and is_allowed_forward_source(message)
+
+
+def parse_character_catcher_message(message: Message) -> ParsedText:
+    raw = get_combined_message_text(message)
+    lines = [clean_value(x) for x in raw.splitlines() if clean_value(x)]
+
+    name = None
+    anime_name = None
+    card_id = None
+
+    match = CHARACTER_CATCHER_NAME_RE.search(raw)
+    if match:
+        card_id = clean_value(match.group(1))
+        name = clean_value(match.group(2))
+
+    for i, line in enumerate(lines):
+        line_match = re.match(r"^\s*(\d+)\s*:\s*(.+?)\s*$", line, re.IGNORECASE)
+        if line_match:
+            if i > 0:
+                anime_name = clean_value(lines[i - 1])
+            break
+
+    return ParsedText(
+        name=name,
+        anime_name=anime_name,
+        rarity=None,
+        card_id=card_id,
+        command_name="/catch",
+        raw_text=raw,
+    )
+
+
+def get_effective_parsed_message(message: Message) -> ParsedText:
+    parsed = parse_caption_text_from_message(message)
+
+    if is_character_catcher_source_message(message):
+        cc_parsed = parse_character_catcher_message(message)
+        if cc_parsed.name:
+            return cc_parsed
+        parsed.command_name = "/catch"
+        return parsed
+
+    if is_hallow_forward_source_message(message):
+        parsed.command_name = "/hallow"
+        return parsed
+
+    return parsed
+
+
+def get_effective_command_for_message(message: Message, parsed: Optional[ParsedText] = None) -> str:
+    if is_character_catcher_source_message(message):
+        return "/catch"
+
+    if is_hallow_forward_source_message(message):
+        return "/hallow"
+
+    if parsed and parsed.command_name:
+        return clean_command_name(parsed.command_name)
+
+    return DEFAULT_COMMAND
+
+
+def get_autosave_source_label(message: Message) -> str:
+    if is_inline_source_bot(message):
+        return f"inline @{(getattr(message.via_bot, 'username', '') or '').strip()}"
+
+    if is_character_catcher_style_message(message):
+        return "Character_Catcher style"
+
+    source_info = get_forward_source_info(message)
+    return (
+        source_info.get("title")
+        or source_info.get("username")
+        or str(source_info.get("chat_id") or "forwarded source")
+    )
 
 
 async def ensure_indexes() -> None:
@@ -694,8 +810,6 @@ async def send_found_result(
     override_command_name: Optional[str] = None,
 ) -> None:
     name = clean_value(item.get("name") or "Unknown")
-
-    #nodbcmd
     command_name = clean_command_name(override_command_name or DEFAULT_COMMAND)
 
     text = build_result_text(item, command_name=command_name)
@@ -706,6 +820,7 @@ async def send_found_result(
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
+
 
 async def send_not_found(message: Message) -> None:
     await message.reply(
@@ -890,7 +1005,7 @@ async def autosave_handler(message: Message, command: CommandObject) -> None:
 
     await message.reply(
         f"Auto-save mode: <b>{'ON' if enabled else 'OFF'}</b>\n"
-        f"{'Forwarded post တွေကို save/update ပဲလုပ်ပါမယ်။' if enabled else 'Normal lookup mode ပြန်ဝင်ပါပြီ။'}",
+        f"{'Forwarded / inline post တွေကို save/update ပဲလုပ်ပါမယ်။' if enabled else 'Normal lookup mode ပြန်ဝင်ပါပြီ။'}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -986,7 +1101,7 @@ async def save_handler(message: Message, command: CommandObject, bot: Bot) -> No
         await message.reply("/save ကို media message ကို reply ပြီးသုံးပါ")
         return
 
-    parsed = parse_caption_text_from_message(target)
+    parsed = get_effective_parsed_message(target)
     if command.args:
         parsed.name = clean_value(command.args)
 
@@ -1029,8 +1144,8 @@ async def name_trigger_handler(message: Message, bot: Bot) -> None:
         await message.reply("photo/video message ကို reply ထောက်ပြီး .name သို့ /name သုံးပါ")
         return
 
-    parsed_target = parse_caption_text_from_message(target)
-    override_cmd = parsed_target.command_name
+    parsed_target = get_effective_parsed_message(target)
+    override_cmd = get_effective_command_for_message(target, parsed_target)
 
     try:
         await lookup_and_reply(message, target, bot, override_command_name=override_cmd)
@@ -1055,41 +1170,40 @@ async def media_handler(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id if message.from_user else None
     autosave_enabled = await get_autosave_mode(user_id)
 
-    parsed = parse_caption_text_from_message(message)
+    parsed = get_effective_parsed_message(message)
+    hallow_forward_source = is_hallow_forward_source_message(message)
+    character_catcher_source = is_character_catcher_source_message(message)
+    any_forwarded = is_forwarded_message(message)
 
-    # DM autosave mode: owner/sudo + /autosave on + forwarded message only
-    if is_private_chat(message) and user_can_save and autosave_enabled and is_forwarded_message(message):
-        if not is_allowed_forward_source(message):
+    # DM autosave mode
+    if is_private_chat(message) and user_can_save and autosave_enabled:
+        if hallow_forward_source or character_catcher_source:
+            if not parsed.name:
+                await message.reply("name မတွေ့ပါ။ supported post ကို forward / send လုပ်ပါ။")
+                return
+
+            try:
+                meta = await get_media_meta(bot, message)
+                doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=user_id)
+
+                status = "Saved" if created else "Updated"
+                source_label = get_autosave_source_label(message)
+
+                await message.reply(
+                    f"{status}: <b>{html_escape(doc['name'])}</b>\n"
+                    f"Mode: <b>auto-save</b>\n"
+                    f"Source: <b>{html_escape(str(source_label))}</b>\n"
+                    f"Cmd: <code>{html_escape(doc['command_name'])}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            except Exception as exc:
+                logger.exception("auto-save failed")
+                await message.reply(f"auto-save error: {exc}")
+                return
+
+        if any_forwarded:
             await message.reply("ဒီ forwarded source ကို auto-save ခွင့်မပြုထားသေးပါဘူး။")
-            return
-
-        if not parsed.name:
-            await message.reply("name မတွေ့ပါ။ Character Name line ပါတဲ့ post ကို forward လုပ်ပါ။")
-            return
-
-        try:
-            meta = await get_media_meta(bot, message)
-            doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=user_id)
-
-            status = "Saved" if created else "Updated"
-            source_info = get_forward_source_info(message)
-            source_label = (
-                source_info.get("title")
-                or source_info.get("username")
-                or str(source_info.get("chat_id") or "forwarded source")
-            )
-
-            await message.reply(
-                f"{status}: <b>{html_escape(doc['name'])}</b>\n"
-                f"Mode: <b>auto-save</b>\n"
-                f"Source: <b>{html_escape(str(source_label))}</b>\n"
-                f"Cmd: <code>{html_escape(doc['command_name'])}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        except Exception as exc:
-            logger.exception("auto-save failed")
-            await message.reply(f"auto-save error: {exc}")
             return
 
     if not user_can_use:
@@ -1097,7 +1211,7 @@ async def media_handler(message: Message, bot: Bot) -> None:
         return
 
     try:
-        override_cmd = parsed.command_name
+        override_cmd = get_effective_command_for_message(message, parsed)
         await lookup_and_reply(message, message, bot, override_command_name=override_cmd)
     except Exception as exc:
         logger.exception("lookup failed")
@@ -1114,6 +1228,7 @@ async def on_startup(bot: Bot) -> None:
     logger.info("Configured source ids: %s", sorted(SOURCE_CHANNEL_IDS) if SOURCE_CHANNEL_IDS else "none")
     logger.info("Configured source usernames: %s", sorted(SOURCE_CHANNEL_USERNAMES) if SOURCE_CHANNEL_USERNAMES else "none")
     logger.info("Configured source titles: %s", sorted(SOURCE_CHANNEL_TITLES) if SOURCE_CHANNEL_TITLES else "none")
+    logger.info("Configured inline source bots: %s", sorted(INLINE_SOURCE_BOTS) if INLINE_SOURCE_BOTS else "none")
 
 
 async def main() -> None:
