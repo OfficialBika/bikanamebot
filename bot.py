@@ -47,6 +47,7 @@ VIDEO_AVG_THRESHOLD = int(os.getenv("VIDEO_AVG_THRESHOLD", "12"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "@Official_Bika").strip()
 DEFAULT_COMMAND = os.getenv("DEFAULT_COMMAND", "/hallow").strip() or "/hallow"
+ADDED_LOG_CHANNEL = os.getenv("ADDED_LOG_CHANNEL", "@WaifuAddedList").strip()
 
 SOURCE_CHANNEL_IDS = {
     int(x.strip())
@@ -66,9 +67,18 @@ SOURCE_CHANNEL_TITLES = {
 
 INLINE_SOURCE_BOTS = {
     x.strip().lstrip("@").lower()
-    for x in os.getenv("INLINE_SOURCE_BOTS", "@Character_Catcher_Bot").split(",")
+    for x in os.getenv(
+        "INLINE_SOURCE_BOTS",
+        "@Character_Catcher_Bot,@Character_Seizer_Bot",
+    ).split(",")
     if x.strip()
 }
+
+INLINE_SOURCE_COMMAND_MAP: dict[str, str] = {}
+if "character_catcher_bot" in INLINE_SOURCE_BOTS:
+    INLINE_SOURCE_COMMAND_MAP["character_catcher_bot"] = "/catch"
+if "character_seizer_bot" in INLINE_SOURCE_BOTS:
+    INLINE_SOURCE_COMMAND_MAP["character_seizer_bot"] = "/seize"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -126,7 +136,7 @@ COMMAND_PATTERNS = [
 
 NAME_TRIGGER_RE = re.compile(r"^(?:\.name|/name)(?:@\w+)?$", re.IGNORECASE)
 CHARACTER_CATCHER_HEADER_RE = re.compile(r"OwO!\s*Check out this character!", re.IGNORECASE)
-CHARACTER_CATCHER_NAME_RE = re.compile(r"^\s*(\d+)\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+NUMBERED_NAME_RE = re.compile(r"^\s*(\d+)\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 
 router = Router()
 
@@ -289,7 +299,7 @@ def build_result_text(item: dict[str, Any], command_name: Optional[str] = None) 
     hint_name = get_hint_name(name)
 
     lines = [
-        f"<b>NAME :</b> <code>{html_escape(f'{name}')}</code>",
+        f"<b>NAME :</b> <code>{html_escape(name)}</code>",
         "────────────────",
         f"🔹 <b>Hint :</b> <code>{html_escape(f'{command_name} {hint_name}')}</code>",
         f"🔸 <b>Full :</b> <code>{html_escape(f'{command_name} {name}')}</code>",
@@ -488,16 +498,20 @@ def is_allowed_forward_source(message: Message) -> bool:
     return False
 
 
-def is_inline_source_bot(message: Message) -> bool:
+def get_inline_source_username(message: Message) -> str:
     via_bot = getattr(message, "via_bot", None)
     if via_bot is None:
-        return False
+        return ""
+    return (getattr(via_bot, "username", "") or "").lower().strip()
 
-    username = (getattr(via_bot, "username", "") or "").lower()
-    if not username:
-        return False
 
-    return username in INLINE_SOURCE_BOTS
+def is_inline_source_bot(message: Message) -> bool:
+    return get_inline_source_username(message) in INLINE_SOURCE_BOTS
+
+
+def get_inline_source_command(message: Message) -> Optional[str]:
+    username = get_inline_source_username(message)
+    return INLINE_SOURCE_COMMAND_MAP.get(username)
 
 
 def is_character_catcher_style_message(message: Message) -> bool:
@@ -505,19 +519,19 @@ def is_character_catcher_style_message(message: Message) -> bool:
     return bool(
         raw
         and CHARACTER_CATCHER_HEADER_RE.search(raw)
-        and CHARACTER_CATCHER_NAME_RE.search(raw)
+        and NUMBERED_NAME_RE.search(raw)
     )
 
 
 def is_character_catcher_source_message(message: Message) -> bool:
-    return is_inline_source_bot(message) or is_character_catcher_style_message(message)
+    return get_inline_source_command(message) == "/catch" or is_character_catcher_style_message(message)
 
 
 def is_hallow_forward_source_message(message: Message) -> bool:
     return is_forwarded_message(message) and is_allowed_forward_source(message)
 
 
-def parse_character_catcher_message(message: Message) -> ParsedText:
+def parse_numbered_name_message(message: Message, forced_command: str) -> ParsedText:
     raw = get_combined_message_text(message)
     lines = [clean_value(x) for x in raw.splitlines() if clean_value(x)]
 
@@ -525,7 +539,7 @@ def parse_character_catcher_message(message: Message) -> ParsedText:
     anime_name = None
     card_id = None
 
-    match = CHARACTER_CATCHER_NAME_RE.search(raw)
+    match = NUMBERED_NAME_RE.search(raw)
     if match:
         card_id = clean_value(match.group(1))
         name = clean_value(match.group(2))
@@ -542,7 +556,7 @@ def parse_character_catcher_message(message: Message) -> ParsedText:
         anime_name=anime_name,
         rarity=None,
         card_id=card_id,
-        command_name="/catch",
+        command_name=forced_command,
         raw_text=raw,
     )
 
@@ -550,8 +564,16 @@ def parse_character_catcher_message(message: Message) -> ParsedText:
 def get_effective_parsed_message(message: Message) -> ParsedText:
     parsed = parse_caption_text_from_message(message)
 
-    if is_character_catcher_source_message(message):
-        cc_parsed = parse_character_catcher_message(message)
+    inline_cmd = get_inline_source_command(message)
+    if inline_cmd:
+        inline_parsed = parse_numbered_name_message(message, inline_cmd)
+        if inline_parsed.name:
+            return inline_parsed
+        parsed.command_name = inline_cmd
+        return parsed
+
+    if is_character_catcher_style_message(message):
+        cc_parsed = parse_numbered_name_message(message, "/catch")
         if cc_parsed.name:
             return cc_parsed
         parsed.command_name = "/catch"
@@ -564,8 +586,12 @@ def get_effective_parsed_message(message: Message) -> ParsedText:
     return parsed
 
 
-def get_effective_command_for_message(message: Message, parsed: Optional[ParsedText] = None) -> str:
-    if is_character_catcher_source_message(message):
+def get_effective_command_for_message(message: Message, parsed: Optional[ParsedText] = None) -> Optional[str]:
+    inline_cmd = get_inline_source_command(message)
+    if inline_cmd:
+        return inline_cmd
+
+    if is_character_catcher_style_message(message):
         return "/catch"
 
     if is_hallow_forward_source_message(message):
@@ -574,12 +600,13 @@ def get_effective_command_for_message(message: Message, parsed: Optional[ParsedT
     if parsed and parsed.command_name:
         return clean_command_name(parsed.command_name)
 
-    return DEFAULT_COMMAND
+    return None
 
 
 def get_autosave_source_label(message: Message) -> str:
-    if is_inline_source_bot(message):
-        return f"inline @{(getattr(message.via_bot, 'username', '') or '').strip()}"
+    inline_username = get_inline_source_username(message)
+    if inline_username:
+        return f"inline @{inline_username}"
 
     if is_character_catcher_style_message(message):
         return "Character_Catcher style"
@@ -590,6 +617,108 @@ def get_autosave_source_label(message: Message) -> str:
         or source_info.get("username")
         or str(source_info.get("chat_id") or "forwarded source")
     )
+
+
+def get_log_source_label(message: Message) -> str:
+    if get_inline_source_command(message):
+        return get_autosave_source_label(message)
+
+    if is_character_catcher_style_message(message):
+        return get_autosave_source_label(message)
+
+    if is_hallow_forward_source_message(message):
+        return get_autosave_source_label(message)
+
+    if is_forwarded_message(message):
+        return get_autosave_source_label(message)
+
+    return "manual-save"
+
+
+def build_user_mention_html(user) -> str:
+    if not user:
+        return "Unknown"
+
+    username = (getattr(user, "username", "") or "").strip()
+    full_name = clean_value(getattr(user, "full_name", "") or username or "Unknown")
+
+    if username:
+        return f'<a href="https://t.me/{html_escape(username)}">{html_escape(full_name)}</a>'
+
+    user_id = getattr(user, "id", None)
+    if user_id:
+        return f'<a href="tg://user?id={user_id}">{html_escape(full_name)}</a>'
+
+    return html_escape(full_name)
+
+
+def build_added_log_caption(
+    *,
+    doc: dict[str, Any],
+    created: bool,
+    mode: str,
+    source_label: str,
+    added_by_user,
+) -> str:
+    status = "Saved" if created else "Updated"
+    name = clean_value(doc.get("name") or "Unknown")
+    card_id = clean_value(doc.get("card_id") or "-")
+    cmd = clean_command_name(doc.get("command_name") or DEFAULT_COMMAND)
+    added_by = build_user_mention_html(added_by_user)
+
+    lines = [
+        f"{status}",
+        f"Name : {html_escape(name)}",
+        f"ID : {html_escape(card_id)}",
+        f"Mode: {html_escape(mode)}",
+        f"Source: {html_escape(source_label)}",
+        f"Cmd: <code>{html_escape(cmd)}</code>",
+        "",
+        f"Added by {added_by}",
+    ]
+    return "\n".join(lines)
+
+async def send_added_log(
+    *,
+    bot: Bot,
+    source_message: Message,
+    doc: dict[str, Any],
+    created: bool,
+    mode: str,
+    source_label: str,
+    added_by_user,
+) -> None:
+    if not ADDED_LOG_CHANNEL:
+        return
+
+    media_type, media = extract_media_handle(source_message)
+    if not media_type or not media:
+        return
+
+    caption = build_added_log_caption(
+        doc=doc,
+        created=created,
+        mode=mode,
+        source_label=source_label,
+        added_by_user=added_by_user,
+    )
+
+    if media_type == "photo":
+        await bot.send_photo(
+            chat_id=ADDED_LOG_CHANNEL,
+            photo=media.file_id,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if media_type == "video":
+        await bot.send_video(
+            chat_id=ADDED_LOG_CHANNEL,
+            video=media.file_id,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
 
 
 async def ensure_indexes() -> None:
@@ -810,7 +939,9 @@ async def send_found_result(
     override_command_name: Optional[str] = None,
 ) -> None:
     name = clean_value(item.get("name") or "Unknown")
-    command_name = clean_command_name(override_command_name or DEFAULT_COMMAND)
+    command_name = clean_command_name(
+        override_command_name or item.get("command_name") or DEFAULT_COMMAND
+    )
 
     text = build_result_text(item, command_name=command_name)
     keyboard = build_copy_keyboard(command_name, name)
@@ -1117,6 +1248,19 @@ async def save_handler(message: Message, command: CommandObject, bot: Bot) -> No
         await message.reply(f"save မအောင်မြင်ပါ: {exc}")
         return
 
+    try:
+        await send_added_log(
+            bot=bot,
+            source_message=target,
+            doc=doc,
+            created=created,
+            mode="manual-save",
+            source_label=get_log_source_label(target),
+            added_by_user=message.from_user,
+        )
+    except Exception:
+        logger.exception("added log send failed")
+
     status = "Saved" if created else "Updated"
     await message.reply(
         f"{status}: <b>{html_escape(doc['name'])}</b>\n"
@@ -1172,12 +1316,13 @@ async def media_handler(message: Message, bot: Bot) -> None:
 
     parsed = get_effective_parsed_message(message)
     hallow_forward_source = is_hallow_forward_source_message(message)
-    character_catcher_source = is_character_catcher_source_message(message)
+    inline_cmd = get_inline_source_command(message)
+    character_catcher_style_source = is_character_catcher_style_message(message)
     any_forwarded = is_forwarded_message(message)
 
     # DM autosave mode
     if is_private_chat(message) and user_can_save and autosave_enabled:
-        if hallow_forward_source or character_catcher_source:
+        if hallow_forward_source or inline_cmd or character_catcher_style_source:
             if not parsed.name:
                 await message.reply("name မတွေ့ပါ။ supported post ကို forward / send လုပ်ပါ။")
                 return
@@ -1186,9 +1331,22 @@ async def media_handler(message: Message, bot: Bot) -> None:
                 meta = await get_media_meta(bot, message)
                 doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=user_id)
 
-                status = "Saved" if created else "Updated"
                 source_label = get_autosave_source_label(message)
 
+                try:
+                    await send_added_log(
+                        bot=bot,
+                        source_message=message,
+                        doc=doc,
+                        created=created,
+                        mode="auto-save",
+                        source_label=str(source_label),
+                        added_by_user=message.from_user,
+                    )
+                except Exception:
+                    logger.exception("added log send failed")
+
+                status = "Saved" if created else "Updated"
                 await message.reply(
                     f"{status}: <b>{html_escape(doc['name'])}</b>\n"
                     f"Mode: <b>auto-save</b>\n"
@@ -1229,6 +1387,7 @@ async def on_startup(bot: Bot) -> None:
     logger.info("Configured source usernames: %s", sorted(SOURCE_CHANNEL_USERNAMES) if SOURCE_CHANNEL_USERNAMES else "none")
     logger.info("Configured source titles: %s", sorted(SOURCE_CHANNEL_TITLES) if SOURCE_CHANNEL_TITLES else "none")
     logger.info("Configured inline source bots: %s", sorted(INLINE_SOURCE_BOTS) if INLINE_SOURCE_BOTS else "none")
+    logger.info("Added log channel: %s", ADDED_LOG_CHANNEL or "none")
 
 
 async def main() -> None:
