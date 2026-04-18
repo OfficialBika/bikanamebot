@@ -49,6 +49,13 @@ OWNER_USERNAME = os.getenv("OWNER_USERNAME", "@Official_Bika").strip()
 DEFAULT_COMMAND = os.getenv("DEFAULT_COMMAND", "/hallow").strip() or "/hallow"
 ADDED_LOG_CHANNEL = os.getenv("ADDED_LOG_CHANNEL", "@WaifuAddedList").strip()
 
+DEFAULT_TARGET_CHAT_RAW = os.getenv("DEFAULT_TARGET_CHAT", "").strip()
+DEFAULT_TARGET_CHAT = (
+    int(DEFAULT_TARGET_CHAT_RAW)
+    if DEFAULT_TARGET_CHAT_RAW and DEFAULT_TARGET_CHAT_RAW.lstrip("-").isdigit()
+    else None
+)
+
 SOURCE_CHANNEL_IDS = {
     int(x.strip())
     for x in os.getenv("SOURCE_CHANNEL_IDS", "").split(",")
@@ -284,6 +291,10 @@ def is_group_chat(message: Message) -> bool:
 
 def is_private_chat(message: Message) -> bool:
     return bool(message.chat and getattr(message.chat, "type", "") == "private")
+
+
+def is_default_target_chat(message: Message) -> bool:
+    return bool(DEFAULT_TARGET_CHAT is not None and message.chat and message.chat.id == DEFAULT_TARGET_CHAT)
 
 
 def powered_by_html() -> str:
@@ -678,6 +689,7 @@ def build_added_log_caption(
     ]
     return "\n".join(lines)
 
+
 async def send_added_log(
     *,
     bot: Bot,
@@ -1044,6 +1056,9 @@ async def set_access(collection, user_doc: dict[str, Any], added_by: int, enable
 # -----------------------------------------------------
 @router.message(Command("start"))
 async def start_handler(message: Message) -> None:
+    if is_default_target_chat(message):
+        return
+
     await remember_user(message)
     if await is_allowed_user(message):
         await message.reply(
@@ -1068,6 +1083,9 @@ async def start_handler(message: Message) -> None:
 
 @router.message(Command("global"))
 async def global_handler(message: Message, command: CommandObject) -> None:
+    if is_default_target_chat(message):
+        return
+
     await remember_user(message)
 
     if not message.from_user or message.from_user.id not in OWNER_IDS:
@@ -1109,8 +1127,8 @@ async def global_handler(message: Message, command: CommandObject) -> None:
 async def autosave_handler(message: Message, command: CommandObject) -> None:
     await remember_user(message)
 
-    if not is_private_chat(message):
-        await message.reply("ဒီ command ကို DM/private chat ထဲမှာပဲ သုံးပါ။")
+    if not (is_private_chat(message) or is_default_target_chat(message)):
+        await message.reply("ဒီ command ကို DM/private chat (or) target chat ထဲမှာပဲ သုံးပါ။")
         return
 
     if not await can_save(message):
@@ -1136,13 +1154,16 @@ async def autosave_handler(message: Message, command: CommandObject) -> None:
 
     await message.reply(
         f"Auto-save mode: <b>{'ON' if enabled else 'OFF'}</b>\n"
-        f"{'Forwarded / inline post တွေကို save/update ပဲလုပ်ပါမယ်။' if enabled else 'Normal lookup mode ပြန်ဝင်ပါပြီ။'}",
+        f"{'Save-only mode ဝင်ပါပြီ။' if enabled else 'Save-only mode ပိတ်လိုက်ပါပြီ။'}",
         parse_mode=ParseMode.HTML,
     )
 
 
 @router.message(Command("stats"))
 async def stats_handler(message: Message) -> None:
+    if is_default_target_chat(message):
+        return
+
     await remember_user(message)
     if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
@@ -1167,6 +1188,9 @@ async def stats_handler(message: Message) -> None:
 
 @router.message(Command("approve"))
 async def approve_handler(message: Message, command: CommandObject, bot: Bot) -> None:
+    if is_default_target_chat(message):
+        return
+
     await remember_user(message)
     if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
@@ -1185,6 +1209,9 @@ async def approve_handler(message: Message, command: CommandObject, bot: Bot) ->
 
 @router.message(Command("addsudo"))
 async def addsudo_handler(message: Message, command: CommandObject, bot: Bot) -> None:
+    if is_default_target_chat(message):
+        return
+
     await remember_user(message)
     if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
@@ -1204,6 +1231,9 @@ async def addsudo_handler(message: Message, command: CommandObject, bot: Bot) ->
 
 @router.message(Command("rmsudo"))
 async def rmsudo_handler(message: Message, command: CommandObject, bot: Bot) -> None:
+    if is_default_target_chat(message):
+        return
+
     await remember_user(message)
     if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
@@ -1222,6 +1252,9 @@ async def rmsudo_handler(message: Message, command: CommandObject, bot: Bot) -> 
 
 @router.message(Command("save"))
 async def save_handler(message: Message, command: CommandObject, bot: Bot) -> None:
+    if is_default_target_chat(message):
+        return
+
     await remember_user(message)
     if not await can_save(message):
         return
@@ -1272,6 +1305,9 @@ async def save_handler(message: Message, command: CommandObject, bot: Bot) -> No
 
 @router.message(F.text.regexp(NAME_TRIGGER_RE))
 async def name_trigger_handler(message: Message, bot: Bot) -> None:
+    if is_default_target_chat(message):
+        return
+
     await remember_user(message)
 
     if not await is_allowed_user(message):
@@ -1320,6 +1356,41 @@ async def media_handler(message: Message, bot: Bot) -> None:
     character_catcher_style_source = is_character_catcher_style_message(message)
     any_forwarded = is_forwarded_message(message)
 
+    # target group: save-only mode
+    if is_default_target_chat(message):
+        if not (user_can_save and autosave_enabled):
+            return
+
+        if not (hallow_forward_source or inline_cmd or character_catcher_style_source):
+            return
+
+        if not parsed.name:
+            return
+
+        try:
+            meta = await get_media_meta(bot, message)
+            doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=user_id or 0)
+
+            source_label = get_autosave_source_label(message)
+
+            try:
+                await send_added_log(
+                    bot=bot,
+                    source_message=message,
+                    doc=doc,
+                    created=created,
+                    mode="auto-save",
+                    source_label=str(source_label),
+                    added_by_user=message.from_user,
+                )
+            except Exception:
+                logger.exception("added log send failed")
+
+        except Exception:
+            logger.exception("target save-only failed")
+
+        return
+
     # DM autosave mode
     if is_private_chat(message) and user_can_save and autosave_enabled:
         if hallow_forward_source or inline_cmd or character_catcher_style_source:
@@ -1329,7 +1400,7 @@ async def media_handler(message: Message, bot: Bot) -> None:
 
             try:
                 meta = await get_media_meta(bot, message)
-                doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=user_id)
+                doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=user_id or 0)
 
                 source_label = get_autosave_source_label(message)
 
@@ -1388,6 +1459,7 @@ async def on_startup(bot: Bot) -> None:
     logger.info("Configured source titles: %s", sorted(SOURCE_CHANNEL_TITLES) if SOURCE_CHANNEL_TITLES else "none")
     logger.info("Configured inline source bots: %s", sorted(INLINE_SOURCE_BOTS) if INLINE_SOURCE_BOTS else "none")
     logger.info("Added log channel: %s", ADDED_LOG_CHANNEL or "none")
+    logger.info("Default target chat: %s", DEFAULT_TARGET_CHAT if DEFAULT_TARGET_CHAT is not None else "none")
 
 
 async def main() -> None:
