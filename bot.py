@@ -17,6 +17,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
+    BotCommand,
     CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -48,6 +49,8 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "@Official_Bika").strip()
 DEFAULT_COMMAND = os.getenv("DEFAULT_COMMAND", "/hallow").strip() or "/hallow"
 ADDED_LOG_CHANNEL = os.getenv("ADDED_LOG_CHANNEL", "@WaifuAddedList").strip()
+SUPPORT_GROUP_USERNAME = os.getenv("SUPPORT_GROUP_USERNAME", "").strip()
+SUPPORT_CHANNEL_USERNAME = os.getenv("SUPPORT_CHANNEL_USERNAME", "").strip()
 
 DEFAULT_TARGET_CHAT_RAW = os.getenv("DEFAULT_TARGET_CHAT", "").strip()
 DEFAULT_TARGET_CHAT = (
@@ -109,6 +112,8 @@ items = db.items
 approved_users = db.approved_users
 sudo_users = db.sudo_users
 known_users = db.known_users
+known_groups = db.known_groups
+gapproved_groups = db.gapproved_groups
 user_modes = db.user_modes
 settings_col = db.settings
 
@@ -142,8 +147,16 @@ COMMAND_PATTERNS = [
 ]
 
 NAME_TRIGGER_RE = re.compile(r"^(?:\.name|/name)(?:@\w+)?$", re.IGNORECASE)
+WAIFU_TRIGGER_RE = re.compile(r"^(?:\.wa|/waifu)(?:@\w+)?$", re.IGNORECASE)
 CHARACTER_CATCHER_HEADER_RE = re.compile(r"OwO!\s*Check out this character!", re.IGNORECASE)
 NUMBERED_NAME_RE = re.compile(r"^\s*(\d+)\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+SUPPORTED_BOTS = [
+    ("hallow", "@Characters_Hallow_bot", ["/hallow"]),
+    ("catcher", "@Character_Catcher_Bot", ["/catch"]),
+    ("seizer", "@Character_Seizer_Bot", ["/sezer", "/seize"]),
+    ("grab", "@Grab_Your_Waifu_Bot", ["/grab"]),
+]
 
 router = Router()
 
@@ -337,6 +350,35 @@ def build_copy_keyboard(command_name: str, name: str) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def build_start_keyboard() -> Optional[InlineKeyboardMarkup]:
+    rows: list[list[InlineKeyboardButton]] = []
+    first_row: list[InlineKeyboardButton] = []
+
+    if SUPPORT_GROUP_USERNAME:
+        first_row.append(
+            InlineKeyboardButton(
+                text="👥 Support Group",
+                url=f"https://t.me/{SUPPORT_GROUP_USERNAME.lstrip('@')}",
+            )
+        )
+
+    if SUPPORT_CHANNEL_USERNAME:
+        first_row.append(
+            InlineKeyboardButton(
+                text="📢 Support Channel",
+                url=f"https://t.me/{SUPPORT_CHANNEL_USERNAME.lstrip('@')}",
+            )
+        )
+
+    if first_row:
+        rows.append(first_row)
+
+    if not rows:
+        return None
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def sha256_hex(data: bytes) -> str:
@@ -733,17 +775,80 @@ async def send_added_log(
         )
 
 
+def get_source_bot_key_from_command(command_name: str) -> str:
+    cmd = clean_command_name(command_name)
+    mapping = {
+        "/hallow": "hallow",
+        "/catch": "catcher",
+        "/seize": "seizer",
+        "/sezer": "seizer",
+        "/grab": "grab",
+    }
+    return mapping.get(cmd, "unknown")
+
+
+async def count_media_for_bot_key(key: str, commands: list[str]) -> int:
+    return await items.count_documents(
+        {
+            "$or": [
+                {"source_bot_key": key},
+                {"command_name": {"$in": commands}},
+            ]
+        }
+    )
+
+
+async def build_status_text() -> str:
+    total_media = await items.count_documents({})
+    total_users = await known_users.count_documents({})
+    total_groups = await known_groups.count_documents({})
+    gapproved_count = await gapproved_groups.count_documents({})
+
+    saved_by_cmd_lines: list[str] = []
+    supported_lines: list[str] = []
+
+    for idx, (key, bot_username, commands) in enumerate(SUPPORTED_BOTS, start=1):
+        count = await count_media_for_bot_key(key, commands)
+        display_cmd = commands[0]
+        saved_by_cmd_lines.append(f"‣ {html_escape(display_cmd)} : <b>{count}</b>")
+        supported_lines.append(f"{idx}. {html_escape(bot_username)} : <b>{count}</b>")
+
+    lines = [
+        "♻ <b>DATABASE</b>",
+        f"‣ Characters : <b>{total_media}</b>",
+        f"‣ Game Bots : <b>{len(SUPPORTED_BOTS)}</b>",
+        "",
+        "🚻 <b>ANALYTICS</b>",
+        f"‣ Total Users : <b>{total_users}</b>",
+        f"‣ Total Groups : <b>{total_groups}</b>",
+        f"‣ GApproved Groups : <b>{gapproved_count}</b>",
+        "",
+        "🎮 <b>Saved Media By Cmd</b>",
+        *saved_by_cmd_lines,
+        "",
+        "🤖 <b>Supported Bot List</b>",
+        *supported_lines,
+    ]
+    return "\n".join(lines)
+
+
 async def ensure_indexes() -> None:
     await items.create_index("file_unique_id", unique=True, sparse=True)
     await items.create_index("sha256", unique=True, sparse=True)
     await items.create_index("media_type")
     await items.create_index("normalized_name")
+    await items.create_index("command_name")
+    await items.create_index("source_bot_key")
     await items.create_index("created_at")
 
     await approved_users.create_index("user_id", unique=True)
     await sudo_users.create_index("user_id", unique=True)
     await known_users.create_index("user_id", unique=True)
     await known_users.create_index("username")
+    await known_groups.create_index("chat_id", unique=True)
+    await known_groups.create_index("username")
+    await gapproved_groups.create_index("chat_id", unique=True)
+    await gapproved_groups.create_index("username")
     await user_modes.create_index("user_id", unique=True)
     await settings_col.create_index("key", unique=True)
 
@@ -766,6 +871,29 @@ async def remember_user(message: Message) -> None:
     )
 
 
+async def remember_chat(message: Message) -> None:
+    await remember_user(message)
+
+    chat = message.chat
+    if not chat:
+        return
+
+    if getattr(chat, "type", "") in {"group", "supergroup"}:
+        await known_groups.update_one(
+            {"chat_id": chat.id},
+            {
+                "$set": {
+                    "chat_id": chat.id,
+                    "title": clean_value(getattr(chat, "title", "") or ""),
+                    "username": (getattr(chat, "username", "") or "").lower(),
+                    "type": getattr(chat, "type", ""),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+
+
 async def is_sudo_user(user_id: Optional[int]) -> bool:
     if not user_id:
         return False
@@ -776,6 +904,49 @@ async def is_approved_user(user_id: Optional[int]) -> bool:
     if not user_id:
         return False
     return await approved_users.find_one({"user_id": user_id}) is not None
+
+
+async def is_group_approved(chat_id: Optional[int]) -> bool:
+    if not chat_id:
+        return False
+    return await gapproved_groups.find_one({"chat_id": chat_id}) is not None
+
+
+async def set_group_approval(chat, approved_by: int, enabled: bool) -> None:
+    if not chat or getattr(chat, "type", "") not in {"group", "supergroup"}:
+        return
+
+    doc = {
+        "chat_id": chat.id,
+        "title": clean_value(getattr(chat, "title", "") or ""),
+        "username": (getattr(chat, "username", "") or "").lower(),
+        "type": getattr(chat, "type", ""),
+        "updated_at": datetime.now(timezone.utc),
+        "updated_by": approved_by,
+    }
+
+    if enabled:
+        doc["approved_at"] = datetime.now(timezone.utc)
+        await gapproved_groups.update_one({"chat_id": chat.id}, {"$set": doc}, upsert=True)
+    else:
+        await gapproved_groups.delete_one({"chat_id": chat.id})
+
+
+async def should_auto_reply_media_in_chat(message: Message) -> bool:
+    if is_default_target_chat(message):
+        return True
+
+    if is_private_chat(message):
+        return True
+
+    if not is_group_chat(message):
+        return True
+
+    if not await get_global_mode():
+        return True
+
+    chat = message.chat
+    return await is_group_approved(getattr(chat, "id", None))
 
 
 async def set_global_mode(enabled: bool, updated_by: int) -> None:
@@ -912,6 +1083,7 @@ async def find_match(meta: MediaMeta) -> Optional[dict[str, Any]]:
 
 async def upsert_item(*, meta: MediaMeta, parsed: ParsedText, saved_by: int) -> tuple[dict[str, Any], bool]:
     command_name = clean_command_name(parsed.command_name or DEFAULT_COMMAND)
+    source_bot_key = get_source_bot_key_from_command(command_name)
     doc = {
         "name": clean_value(parsed.name or ""),
         "normalized_name": normalize_name(parsed.name or ""),
@@ -919,6 +1091,7 @@ async def upsert_item(*, meta: MediaMeta, parsed: ParsedText, saved_by: int) -> 
         "rarity": clean_value(parsed.rarity or ""),
         "card_id": clean_value(parsed.card_id or ""),
         "command_name": command_name,
+        "source_bot_key": source_bot_key,
         "raw_text": parsed.raw_text,
         "media_type": meta.media_type,
         "file_id": meta.file_id,
@@ -1003,7 +1176,7 @@ async def resolve_user_reference(message: Message, bot: Bot, raw_arg: Optional[s
         known = await known_users.find_one({"user_id": int(arg)})
         return known or {"user_id": int(arg), "username": "", "full_name": ""}
 
-    if arg.startswith("@"):
+    if arg.startswith("@"): 
         username = arg.lstrip("@").lower()
         known = await known_users.find_one({"username": username})
         if known:
@@ -1051,6 +1224,36 @@ async def set_access(collection, user_doc: dict[str, Any], added_by: int, enable
         await collection.delete_one({"user_id": user_doc["user_id"]})
 
 
+async def handle_lookup_trigger(message: Message, bot: Bot) -> None:
+    if is_default_target_chat(message):
+        return
+
+    await remember_chat(message)
+
+    if not await is_allowed_user(message):
+        await require_access(message)
+        return
+
+    target = message.reply_to_message
+    if not target:
+        await message.reply("media message ကို reply ထောက်ပြီး /name, /waifu သို့ .wa သုံးပါ")
+        return
+
+    media_type, _media = extract_media_handle(target)
+    if not media_type:
+        await message.reply("photo/video message ကို reply ထောက်ပြီး /name, /waifu သို့ .wa သုံးပါ")
+        return
+
+    parsed_target = get_effective_parsed_message(target)
+    override_cmd = get_effective_command_for_message(target, parsed_target)
+
+    try:
+        await lookup_and_reply(message, target, bot, override_command_name=override_cmd)
+    except Exception as exc:
+        logger.exception("reply lookup failed")
+        await message.reply(f"စစ်ဆေးရာမှာ error ဖြစ်နေပါတယ်: {exc}")
+
+
 # -----------------------------------------------------
 # Commands
 # -----------------------------------------------------
@@ -1059,26 +1262,49 @@ async def start_handler(message: Message) -> None:
     if is_default_target_chat(message):
         return
 
-    await remember_user(message)
+    await remember_chat(message)
+    keyboard = build_start_keyboard()
+
     if await is_allowed_user(message):
         await message.reply(
             "ဒီ bot က photo/video post တွေကို match စစ်ပြီး name ပြန်ထုတ်ပေးပါတယ်。\n\n"
             "• Approved user: media ကို forward / upload လုပ်တာနဲ့ lookup လုပ်ပေးမယ်\n"
-            "• Group: media ကို reply ထောက်ပြီး .name or /name နဲ့မေးလို့ရမယ်\n"
+            "• Group: media ကို reply ထောက်ပြီး /name, /waifu, .wa နဲ့မေးလို့ရမယ်\n"
+            "• /status: database နဲ့ analytics ကြည့်လို့ရမယ်\n"
+            "• Global ON မှာ /gapprove လုပ်ထားတဲ့ group တွေမှာပဲ auto media lookup အလုပ်လုပ်မယ်\n"
             "• Owner/Sudo: DM ထဲ /autosave on လုပ်ပြီး New post တွေကို Name save/update လုပ်လို့ရမယ်\n"
-            "• Owner/Sudo: /save နဲ့ ပုံ+Name ကို manual save လည်း လုပ်လို့ရပါတယ်"
+            "• Owner/Sudo: /save နဲ့ ပုံ+Name ကို manual save လည်း လုပ်လို့ရပါတယ်",
+            reply_markup=keyboard,
         )
         return
 
     global_mode = await get_global_mode()
     if global_mode:
-        await message.reply("Global mode ON ဖြစ်နေပါတယ်။ ဘယ်သူမဆို သုံးလို့ရပါတယ်။")
+        await message.reply(
+            "Global mode ON ဖြစ်နေပါတယ်။ ဘယ်သူမဆို သုံးလို့ရပါတယ်။",
+            reply_markup=keyboard,
+        )
         return
 
     await message.reply(
         "ဒီ bot ကိုသုံးဖို့ approval လိုပါတယ်。\n"
-        "Owner ကို Legendary 1 card ပေးပြီး approve လုပ်ခိုင်းပါ။"
+        "Owner ကို Legendary 1 card ပေးပြီး approve လုပ်ခိုင်းပါ။",
+        reply_markup=keyboard,
     )
+
+
+@router.message(Command("status"))
+async def status_command(message: Message) -> None:
+    if is_default_target_chat(message):
+        return
+
+    await remember_chat(message)
+    if not await is_allowed_user(message):
+        await require_access(message)
+        return
+
+    text = await build_status_text()
+    await message.reply(text, parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("global"))
@@ -1086,7 +1312,7 @@ async def global_handler(message: Message, command: CommandObject) -> None:
     if is_default_target_chat(message):
         return
 
-    await remember_user(message)
+    await remember_chat(message)
 
     if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
@@ -1118,14 +1344,75 @@ async def global_handler(message: Message, command: CommandObject) -> None:
 
     await message.reply(
         f"Global mode: <b>{'ON' if enabled else 'OFF'}</b>\n"
-        f"{'အခု ဘယ်သူမဆို bot ကို သုံးလို့ရပါပြီ။' if enabled else 'အခု approve ထားတဲ့သူတွေပဲ bot ကို သုံးလို့ရပါမယ်။'}",
+        f"{'DM မှာတော့ all အလုပ်လုပ်မယ်။ Group auto media lookup က /gapprove group တွေမှာပဲ အလုပ်လုပ်မယ်။' if enabled else 'DM & Group တိုင်းမှာ approve user / sudo ပဲ bot ကို သုံးလို့ရပါမယ်။'}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("gapprove"))
+async def gapprove_handler(message: Message) -> None:
+    if is_default_target_chat(message):
+        return
+
+    await remember_chat(message)
+
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
+        return
+
+    if not is_group_chat(message):
+        await message.reply("/gapprove ကို approve လုပ်ချင်တဲ့ group ထဲမှာပဲ သုံးပါ")
+        return
+
+    await set_group_approval(message.chat, message.from_user.id, True)
+    await message.reply(
+        f"Group approved for auto media lookup: <b>{html_escape(clean_value(getattr(message.chat, 'title', '') or str(message.chat.id)))}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("grmapprove"))
+async def grmapprove_handler(message: Message) -> None:
+    if is_default_target_chat(message):
+        return
+
+    await remember_chat(message)
+
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
+        return
+
+    if not is_group_chat(message):
+        await message.reply("/grmapprove ကို group ထဲမှာပဲ သုံးပါ")
+        return
+
+    await set_group_approval(message.chat, message.from_user.id, False)
+    await message.reply(
+        f"Group auto media lookup removed: <b>{html_escape(clean_value(getattr(message.chat, 'title', '') or str(message.chat.id)))}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("gstatus"))
+async def gstatus_handler(message: Message) -> None:
+    if is_default_target_chat(message):
+        return
+
+    await remember_chat(message)
+
+    if not is_group_chat(message):
+        return
+
+    approved = await is_group_approved(message.chat.id)
+    global_mode = await get_global_mode()
+    await message.reply(
+        f"Group auto lookup: <b>{'ON' if approved else 'OFF'}</b>\n"
+        f"Global mode: <b>{'ON' if global_mode else 'OFF'}</b>",
         parse_mode=ParseMode.HTML,
     )
 
 
 @router.message(Command("autosave"))
 async def autosave_handler(message: Message, command: CommandObject) -> None:
-    await remember_user(message)
+    await remember_chat(message)
 
     if not (is_private_chat(message) or is_default_target_chat(message)):
         await message.reply("ဒီ command ကို DM/private chat (or) target chat ထဲမှာပဲ သုံးပါ။")
@@ -1164,8 +1451,9 @@ async def stats_handler(message: Message) -> None:
     if is_default_target_chat(message):
         return
 
-    await remember_user(message)
-    if not message.from_user or message.from_user.id not in OWNER_IDS:
+    await remember_chat(message)
+    user_id = message.from_user.id if message.from_user else None
+    if not user_id or (user_id not in OWNER_IDS and not await is_sudo_user(user_id)):
         return
 
     total = await items.count_documents({})
@@ -1173,15 +1461,21 @@ async def stats_handler(message: Message) -> None:
     videos = await items.count_documents({"media_type": "video"})
     approved = await approved_users.count_documents({})
     sudos = await sudo_users.count_documents({})
+    users = await known_users.count_documents({})
+    groups = await known_groups.count_documents({})
     global_mode = await get_global_mode()
+    gapproved_count = await gapproved_groups.count_documents({})
 
     await message.reply(
-        f"Total saved: <b>{total}</b>\n"
-        f"Photos: <b>{photos}</b>\n"
-        f"Videos: <b>{videos}</b>\n"
-        f"Approved users: <b>{approved}</b>\n"
-        f"Sudo users: <b>{sudos}</b>\n"
-        f"Global mode: <b>{'ON' if global_mode else 'OFF'}</b>",
+        f"📊 <b>Owner Stats</b>\n\n"
+        f"‣ Total Media: <b>{total}</b>\n"
+        f"‣ Photos: <b>{photos}</b>\n"
+        f"‣ Videos: <b>{videos}</b>\n"
+        f"‣ Total Users: <b>{users}</b>\n"
+        f"‣ Total Groups: <b>{groups}</b>\n"
+        f"‣ Approved Users: <b>{approved}</b>\n"
+        f"‣ Sudo Users: <b>{sudos}</b>\n"
+        f"‣ Global Mode: <b>{'ON' if global_mode else 'OFF'}</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1191,7 +1485,7 @@ async def approve_handler(message: Message, command: CommandObject, bot: Bot) ->
     if is_default_target_chat(message):
         return
 
-    await remember_user(message)
+    await remember_chat(message)
     if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
 
@@ -1212,7 +1506,7 @@ async def addsudo_handler(message: Message, command: CommandObject, bot: Bot) ->
     if is_default_target_chat(message):
         return
 
-    await remember_user(message)
+    await remember_chat(message)
     if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
 
@@ -1234,7 +1528,7 @@ async def rmsudo_handler(message: Message, command: CommandObject, bot: Bot) -> 
     if is_default_target_chat(message):
         return
 
-    await remember_user(message)
+    await remember_chat(message)
     if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
 
@@ -1255,7 +1549,7 @@ async def save_handler(message: Message, command: CommandObject, bot: Bot) -> No
     if is_default_target_chat(message):
         return
 
-    await remember_user(message)
+    await remember_chat(message)
     if not await can_save(message):
         return
 
@@ -1305,33 +1599,12 @@ async def save_handler(message: Message, command: CommandObject, bot: Bot) -> No
 
 @router.message(F.text.regexp(NAME_TRIGGER_RE))
 async def name_trigger_handler(message: Message, bot: Bot) -> None:
-    if is_default_target_chat(message):
-        return
+    await handle_lookup_trigger(message, bot)
 
-    await remember_user(message)
 
-    if not await is_allowed_user(message):
-        await require_access(message)
-        return
-
-    target = message.reply_to_message
-    if not target:
-        await message.reply("media message ကို reply ထောက်ပြီး .name သို့ /name သုံးပါ")
-        return
-
-    media_type, _media = extract_media_handle(target)
-    if not media_type:
-        await message.reply("photo/video message ကို reply ထောက်ပြီး .name သို့ /name သုံးပါ")
-        return
-
-    parsed_target = get_effective_parsed_message(target)
-    override_cmd = get_effective_command_for_message(target, parsed_target)
-
-    try:
-        await lookup_and_reply(message, target, bot, override_command_name=override_cmd)
-    except Exception as exc:
-        logger.exception("reply lookup failed")
-        await message.reply(f"စစ်ဆေးရာမှာ error ဖြစ်နေပါတယ်: {exc}")
+@router.message(F.text.regexp(WAIFU_TRIGGER_RE))
+async def waifu_trigger_handler(message: Message, bot: Bot) -> None:
+    await handle_lookup_trigger(message, bot)
 
 
 # -----------------------------------------------------
@@ -1339,7 +1612,7 @@ async def name_trigger_handler(message: Message, bot: Bot) -> None:
 # -----------------------------------------------------
 @router.message(F.photo | F.video)
 async def media_handler(message: Message, bot: Bot) -> None:
-    await remember_user(message)
+    await remember_chat(message)
 
     media_type, _media = extract_media_handle(message)
     if not media_type:
@@ -1355,6 +1628,8 @@ async def media_handler(message: Message, bot: Bot) -> None:
     inline_cmd = get_inline_source_command(message)
     character_catcher_style_source = is_character_catcher_style_message(message)
     any_forwarded = is_forwarded_message(message)
+
+    group_auto_allowed = await should_auto_reply_media_in_chat(message)
 
     # target group: save-only mode
     if is_default_target_chat(message):
@@ -1435,6 +1710,9 @@ async def media_handler(message: Message, bot: Bot) -> None:
             await message.reply("ဒီ forwarded source ကို auto-save ခွင့်မပြုထားသေးပါဘူး။")
             return
 
+    if not group_auto_allowed:
+        return
+
     if not user_can_use:
         await require_access(message)
         return
@@ -1452,6 +1730,13 @@ async def media_handler(message: Message, bot: Bot) -> None:
 # -----------------------------------------------------
 async def on_startup(bot: Bot) -> None:
     await ensure_indexes()
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Start the bot"),
+            BotCommand(command="status", description="Show bot database status"),
+            BotCommand(command="stats", description="Owner stats"),
+        ]
+    )
     me = await bot.get_me()
     logger.info("Bot started as @%s", me.username)
     logger.info("Configured source ids: %s", sorted(SOURCE_CHANNEL_IDS) if SOURCE_CHANNEL_IDS else "none")
