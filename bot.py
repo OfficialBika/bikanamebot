@@ -75,23 +75,20 @@ SOURCE_CHANNEL_TITLES = {
     if x.strip()
 }
 
-KNOWN_INLINE_SOURCE_COMMAND_MAP: dict[str, str] = {
-    "character_catcher_bot": "/catch",
-    "character_seizer_bot": "/seize",
-    "capturecharacterbot": "/capture",
-    "capture_character_bot": "/capture",
+INLINE_SOURCE_BOTS = {
+    x.strip().lstrip("@").lower()
+    for x in os.getenv(
+        "INLINE_SOURCE_BOTS",
+        "@Character_Catcher_Bot,@Character_Seizer_Bot",
+    ).split(",")
+    if x.strip()
 }
 
-INLINE_SOURCE_BOTS = set(KNOWN_INLINE_SOURCE_COMMAND_MAP.keys())
-INLINE_SOURCE_BOTS.update(
-    {
-        x.strip().lstrip("@").lower()
-        for x in os.getenv("INLINE_SOURCE_BOTS", "").split(",")
-        if x.strip()
-    }
-)
-
-INLINE_SOURCE_COMMAND_MAP: dict[str, str] = dict(KNOWN_INLINE_SOURCE_COMMAND_MAP)
+INLINE_SOURCE_COMMAND_MAP: dict[str, str] = {}
+if "character_catcher_bot" in INLINE_SOURCE_BOTS:
+    INLINE_SOURCE_COMMAND_MAP["character_catcher_bot"] = "/catch"
+if "character_seizer_bot" in INLINE_SOURCE_BOTS:
+    INLINE_SOURCE_COMMAND_MAP["character_seizer_bot"] = "/seize"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -157,8 +154,7 @@ NUMBERED_NAME_RE = re.compile(r"^\s*(\d+)\s*:\s*(.+?)\s*$", re.IGNORECASE | re.M
 SUPPORTED_BOTS = [
     ("hallow", "@Characters_Hallow_bot", ["/hallow"]),
     ("catcher", "@Character_Catcher_Bot", ["/catch"]),
-    ("seizer", "@Character_Seizer_Bot", ["/seize", "/sezer"]),
-    ("capture", "@CaptureCharacterBot", ["/capture"]),
+    ("seizer", "@Character_Seizer_Bot", ["/sezer", "/seize"]),
     ("grab", "@Grab_Your_Waifu_Bot", ["/grab"]),
 ]
 
@@ -786,7 +782,6 @@ def get_source_bot_key_from_command(command_name: str) -> str:
         "/catch": "catcher",
         "/seize": "seizer",
         "/sezer": "seizer",
-        "/capture": "capture",
         "/grab": "grab",
     }
     return mapping.get(cmd, "unknown")
@@ -1037,29 +1032,6 @@ async def get_autosave_mode(user_id: Optional[int]) -> bool:
         return False
     row = await user_modes.find_one({"user_id": user_id})
     return bool(row and row.get("autosave_enabled"))
-
-
-async def set_target_chat_autosave_mode(chat_id: int, enabled: bool, updated_by: int) -> None:
-    await settings_col.update_one(
-        {"key": f"target_chat_autosave:{chat_id}"},
-        {
-            "$set": {
-                "key": f"target_chat_autosave:{chat_id}",
-                "chat_id": chat_id,
-                "enabled": enabled,
-                "updated_by": updated_by,
-                "updated_at": datetime.now(timezone.utc),
-            }
-        },
-        upsert=True,
-    )
-
-
-async def get_target_chat_autosave_mode(chat_id: Optional[int]) -> bool:
-    if not chat_id:
-        return False
-    row = await settings_col.find_one({"key": f"target_chat_autosave:{chat_id}"})
-    return bool(row and row.get("enabled"))
 
 
 async def find_match(meta: MediaMeta) -> Optional[dict[str, Any]]:
@@ -1454,27 +1426,6 @@ async def autosave_handler(message: Message, command: CommandObject) -> None:
         await message.reply("အသုံးပြုပုံ:\n/autosave on\n/autosave off\n/autosave status")
         return
 
-    if is_default_target_chat(message):
-        chat_id = message.chat.id
-
-        if arg == "status":
-            enabled = await get_target_chat_autosave_mode(chat_id)
-            await message.reply(
-                f"Target Chat Auto-save mode: <b>{'ON' if enabled else 'OFF'}</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        enabled = arg == "on"
-        await set_target_chat_autosave_mode(chat_id, enabled, message.from_user.id)
-
-        await message.reply(
-            f"Target Chat Auto-save mode: <b>{'ON' if enabled else 'OFF'}</b>\n"
-            f"{'ဒီ target chat ထဲမှာ save-only mode ON ဖြစ်ပါပြီ။' if enabled else 'ဒီ target chat ထဲမှာ save-only mode OFF ဖြစ်သွားပါပြီ။'}",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
     user_id = message.from_user.id
 
     if arg == "status":
@@ -1682,25 +1633,18 @@ async def media_handler(message: Message, bot: Bot) -> None:
 
     # target group: save-only mode
     if is_default_target_chat(message):
-        target_chat_autosave_enabled = await get_target_chat_autosave_mode(message.chat.id)
-
-        if not target_chat_autosave_enabled:
+        if not (user_can_save and autosave_enabled):
             return
 
         if not (hallow_forward_source or inline_cmd or character_catcher_style_source):
             return
 
         if not parsed.name:
-            await message.reply("name မတွေ့ပါ။ supported post ကို forward / send လုပ်ပါ။")
             return
 
         try:
             meta = await get_media_meta(bot, message)
-            doc, created = await upsert_item(
-                meta=meta,
-                parsed=parsed,
-                saved_by=user_id or 0,
-            )
+            doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=user_id or 0)
 
             source_label = get_autosave_source_label(message)
 
@@ -1717,19 +1661,8 @@ async def media_handler(message: Message, bot: Bot) -> None:
             except Exception:
                 logger.exception("added log send failed")
 
-            status = "Saved" if created else "Updated"
-            await message.reply(
-                f"{status}: <b>{html_escape(doc['name'])}</b>\n"
-                f"ID: <b>{html_escape(doc.get('card_id') or '-')}</b>\n"
-                f"Mode: <b>auto-save</b>\n"
-                f"Source: <b>{html_escape(str(source_label))}</b>\n"
-                f"Cmd: <code>{html_escape(doc['command_name'])}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-
-        except Exception as exc:
+        except Exception:
             logger.exception("target save-only failed")
-            await message.reply(f"target auto-save error: {exc}")
 
         return
 
