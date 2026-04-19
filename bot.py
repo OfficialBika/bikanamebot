@@ -18,6 +18,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
+    CallbackQuery,
     CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -75,20 +76,23 @@ SOURCE_CHANNEL_TITLES = {
     if x.strip()
 }
 
-INLINE_SOURCE_BOTS = {
-    x.strip().lstrip("@").lower()
-    for x in os.getenv(
-        "INLINE_SOURCE_BOTS",
-        "@Character_Catcher_Bot,@Character_Seizer_Bot",
-    ).split(",")
-    if x.strip()
+KNOWN_INLINE_SOURCE_COMMAND_MAP: dict[str, str] = {
+    "character_catcher_bot": "/catch",
+    "character_seizer_bot": "/seize",
+    "capturecharacterbot": "/capture",
+    "capture_character_bot": "/capture",
 }
 
-INLINE_SOURCE_COMMAND_MAP: dict[str, str] = {}
-if "character_catcher_bot" in INLINE_SOURCE_BOTS:
-    INLINE_SOURCE_COMMAND_MAP["character_catcher_bot"] = "/catch"
-if "character_seizer_bot" in INLINE_SOURCE_BOTS:
-    INLINE_SOURCE_COMMAND_MAP["character_seizer_bot"] = "/seize"
+INLINE_SOURCE_BOTS = set(KNOWN_INLINE_SOURCE_COMMAND_MAP.keys())
+INLINE_SOURCE_BOTS.update(
+    {
+        x.strip().lstrip("@").lower()
+        for x in os.getenv("INLINE_SOURCE_BOTS", "").split(",")
+        if x.strip()
+    }
+)
+
+INLINE_SOURCE_COMMAND_MAP: dict[str, str] = dict(KNOWN_INLINE_SOURCE_COMMAND_MAP)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -154,11 +158,15 @@ NUMBERED_NAME_RE = re.compile(r"^\s*(\d+)\s*:\s*(.+?)\s*$", re.IGNORECASE | re.M
 SUPPORTED_BOTS = [
     ("hallow", "@Characters_Hallow_bot", ["/hallow"]),
     ("catcher", "@Character_Catcher_Bot", ["/catch"]),
-    ("seizer", "@Character_Seizer_Bot", ["/sezer", "/seize"]),
+    ("seizer", "@Character_Seizer_Bot", ["/seize", "/sezer"]),
+    ("capture", "@CaptureCharacterBot", ["/capture"]),
     ("grab", "@Grab_Your_Waifu_Bot", ["/grab"]),
 ]
 
 router = Router()
+
+FORCE_JOIN_VERIFY_CALLBACK = "forcejoin_verify"
+FORCE_JOIN_START_PAYLOAD = "verify"
 
 
 @dataclass
@@ -379,6 +387,198 @@ def build_start_keyboard() -> Optional[InlineKeyboardMarkup]:
         return None
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def support_chat_ref(username: str) -> Optional[str]:
+    value = clean_value(username).strip()
+    if not value:
+        return None
+    return f"@{value.lstrip('@')}"
+
+
+def support_chat_url(username: str) -> Optional[str]:
+    value = clean_value(username).strip()
+    if not value:
+        return None
+    return f"https://t.me/{value.lstrip('@')}"
+
+
+def force_join_enabled() -> bool:
+    return bool(SUPPORT_CHANNEL_USERNAME or SUPPORT_GROUP_USERNAME)
+
+
+def build_force_join_group_text() -> str:
+    return (
+        "🔒 <b>Verification Needed</b>\n\n"
+        "<b>My</b>\n"
+        "ဒီ bot ကိုသုံးဖို့ Support Channel နဲ့ Support Group နှစ်ခုလုံး join ထားရပါမယ်။\n"
+        "အောက်က button ကိုနှိပ်ပြီး DM ထဲမှာ verify လုပ်ပေးပါ။\n\n"
+        "<b>Eng</b>\n"
+        "To use this bot, you need to join both our Support Channel and Support Group.\n"
+        "Tap the button below and verify your membership in DM."
+    )
+
+
+def build_force_join_dm_text(cjoin: bool, gjoin: bool) -> str:
+    channel_state = "✅ Joined" if cjoin else "❌ Not Joined"
+    group_state = "✅ Joined" if gjoin else "❌ Not Joined"
+
+    return (
+        "🚫 <b>Access Limited</b>\n\n"
+        "<b>My</b>\n"
+        "ဒီ bot ကိုအသုံးပြုဖို့ Support Channel နဲ့ Support Group နှစ်ခုလုံး join ထားရပါမယ်။\n"
+        "အောက်က button တွေကနေ အရင် join လုပ်ပြီး <b>Verify Membership</b> ကိုနှိပ်ပါ။\n\n"
+        f"• Channel : <b>{channel_state}</b>\n"
+        f"• Group : <b>{group_state}</b>\n\n"
+        "<b>Eng</b>\n"
+        "To use this bot, you must join both our Support Channel and Support Group first.\n"
+        "Use the buttons below to join, then tap <b>Verify Membership</b>.\n\n"
+        f"• Channel : <b>{channel_state}</b>\n"
+        f"• Group : <b>{group_state}</b>"
+    )
+
+
+def build_force_join_success_text() -> str:
+    return (
+        "✅ <b>Verification Complete</b>\n\n"
+        "<b>My</b>\n"
+        "Support Channel နဲ့ Support Group join စစ်ဆေးမှု အောင်မြင်ပါတယ်။\n"
+        "အခု bot ကို ဆက်သုံးလို့ရပါပြီ။\n\n"
+        "<b>Eng</b>\n"
+        "Your membership check is complete.\n"
+        "You can now continue using the bot."
+    )
+
+
+def build_force_join_group_keyboard(bot_username: str) -> InlineKeyboardMarkup:
+    verify_url = f"https://t.me/{bot_username.lstrip('@')}?start={FORCE_JOIN_START_PAYLOAD}"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Verify in DM", url=verify_url)]
+        ]
+    )
+
+
+def build_force_join_dm_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    first_row: list[InlineKeyboardButton] = []
+    channel_url = support_chat_url(SUPPORT_CHANNEL_USERNAME)
+    group_url = support_chat_url(SUPPORT_GROUP_USERNAME)
+
+    if channel_url:
+        first_row.append(InlineKeyboardButton(text="📢 Join Channel", url=channel_url))
+    if group_url:
+        first_row.append(InlineKeyboardButton(text="👥 Join Group", url=group_url))
+    if first_row:
+        rows.append(first_row)
+
+    rows.append(
+        [InlineKeyboardButton(text="✅ Verify Membership", callback_data=FORCE_JOIN_VERIFY_CALLBACK)]
+    )
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def is_active_member_status(member: Any) -> bool:
+    status = getattr(member, "status", None)
+    if status in {"member", "administrator", "creator"}:
+        return True
+    if status == "restricted":
+        return bool(getattr(member, "is_member", False))
+    return False
+
+
+async def check_single_support_membership(bot: Bot, user_id: int, chat_ref: Optional[str]) -> bool:
+    if not chat_ref:
+        return True
+
+    try:
+        member = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
+        return is_active_member_status(member)
+    except Exception as exc:
+        logger.warning("support membership check failed for %s in %s: %s", user_id, chat_ref, exc)
+        return False
+
+
+async def refresh_force_join_flags(bot: Bot, user_id: Optional[int]) -> tuple[bool, bool]:
+    if not user_id:
+        return True, True
+
+    cjoin = await check_single_support_membership(bot, user_id, support_chat_ref(SUPPORT_CHANNEL_USERNAME))
+    gjoin = await check_single_support_membership(bot, user_id, support_chat_ref(SUPPORT_GROUP_USERNAME))
+
+    await known_users.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "cjoin": bool(cjoin),
+                "gjoin": bool(gjoin),
+                "join_checked_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+    return bool(cjoin), bool(gjoin)
+
+
+async def send_force_join_group_prompt(message: Message, bot: Bot) -> None:
+    me = await bot.get_me()
+    await message.reply(
+        build_force_join_group_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_force_join_group_keyboard(me.username or ""),
+        disable_web_page_preview=True,
+    )
+
+
+async def send_force_join_dm_prompt(message: Message, bot: Bot) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    cjoin, gjoin = await refresh_force_join_flags(bot, user_id)
+
+    await message.reply(
+        build_force_join_dm_text(cjoin, gjoin),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_force_join_dm_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+
+async def ensure_force_join_access(
+    message: Message,
+    bot: Bot,
+    *,
+    group_prompt: bool = True,
+    dm_prompt: bool = True,
+) -> bool:
+    if not force_join_enabled():
+        return True
+
+    user_id = message.from_user.id if message.from_user else None
+    if not user_id:
+        return False
+
+    if user_id in OWNER_IDS or await is_sudo_user(user_id):
+        return True
+
+    cjoin, gjoin = await refresh_force_join_flags(bot, user_id)
+    if cjoin and gjoin:
+        return True
+
+    if is_private_chat(message):
+        if dm_prompt:
+            await send_force_join_dm_prompt(message, bot)
+        return False
+
+    if is_group_chat(message):
+        if group_prompt:
+            await send_force_join_group_prompt(message, bot)
+        return False
+
+    if dm_prompt:
+        await send_force_join_dm_prompt(message, bot)
+    return False
 
 
 def sha256_hex(data: bytes) -> str:
@@ -782,6 +982,7 @@ def get_source_bot_key_from_command(command_name: str) -> str:
         "/catch": "catcher",
         "/seize": "seizer",
         "/sezer": "seizer",
+        "/capture": "capture",
         "/grab": "grab",
     }
     return mapping.get(cmd, "unknown")
@@ -845,6 +1046,8 @@ async def ensure_indexes() -> None:
     await sudo_users.create_index("user_id", unique=True)
     await known_users.create_index("user_id", unique=True)
     await known_users.create_index("username")
+    await known_users.create_index("cjoin")
+    await known_users.create_index("gjoin")
     await known_groups.create_index("chat_id", unique=True)
     await known_groups.create_index("username")
     await gapproved_groups.create_index("chat_id", unique=True)
@@ -1032,6 +1235,29 @@ async def get_autosave_mode(user_id: Optional[int]) -> bool:
         return False
     row = await user_modes.find_one({"user_id": user_id})
     return bool(row and row.get("autosave_enabled"))
+
+
+async def set_target_chat_autosave_mode(chat_id: int, enabled: bool, updated_by: int) -> None:
+    await settings_col.update_one(
+        {"key": f"target_chat_autosave:{chat_id}"},
+        {
+            "$set": {
+                "key": f"target_chat_autosave:{chat_id}",
+                "chat_id": chat_id,
+                "enabled": enabled,
+                "updated_by": updated_by,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def get_target_chat_autosave_mode(chat_id: Optional[int]) -> bool:
+    if not chat_id:
+        return False
+    row = await settings_col.find_one({"key": f"target_chat_autosave:{chat_id}"})
+    return bool(row and row.get("enabled"))
 
 
 async def find_match(meta: MediaMeta) -> Optional[dict[str, Any]]:
@@ -1230,6 +1456,9 @@ async def handle_lookup_trigger(message: Message, bot: Bot) -> None:
 
     await remember_chat(message)
 
+    if not await ensure_force_join_access(message, bot, group_prompt=True, dm_prompt=True):
+        return
+
     if not await is_allowed_user(message):
         await require_access(message)
         return
@@ -1258,11 +1487,15 @@ async def handle_lookup_trigger(message: Message, bot: Bot) -> None:
 # Commands
 # -----------------------------------------------------
 @router.message(Command("start"))
-async def start_handler(message: Message) -> None:
+async def start_handler(message: Message, command: CommandObject, bot: Bot) -> None:
     if is_default_target_chat(message):
         return
 
     await remember_chat(message)
+
+    if force_join_enabled() and not await ensure_force_join_access(message, bot, group_prompt=True, dm_prompt=True):
+        return
+
     keyboard = build_start_keyboard()
 
     if await is_allowed_user(message):
@@ -1294,11 +1527,13 @@ async def start_handler(message: Message) -> None:
 
 
 @router.message(Command("status"))
-async def status_command(message: Message) -> None:
+async def status_command(message: Message, bot: Bot) -> None:
     if is_default_target_chat(message):
         return
 
     await remember_chat(message)
+    if not await ensure_force_join_access(message, bot, group_prompt=True, dm_prompt=True):
+        return
     if not await is_allowed_user(message):
         await require_access(message)
         return
@@ -1424,6 +1659,27 @@ async def autosave_handler(message: Message, command: CommandObject) -> None:
     arg = clean_value(command.args or "").lower()
     if arg not in {"on", "off", "status"}:
         await message.reply("အသုံးပြုပုံ:\n/autosave on\n/autosave off\n/autosave status")
+        return
+
+    if is_default_target_chat(message):
+        chat_id = message.chat.id
+
+        if arg == "status":
+            enabled = await get_target_chat_autosave_mode(chat_id)
+            await message.reply(
+                f"Target Chat Auto-save mode: <b>{'ON' if enabled else 'OFF'}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        enabled = arg == "on"
+        await set_target_chat_autosave_mode(chat_id, enabled, message.from_user.id)
+
+        await message.reply(
+            f"Target Chat Auto-save mode: <b>{'ON' if enabled else 'OFF'}</b>\n"
+            f"{'ဒီ target chat ထဲမှာ save-only mode ON ဖြစ်ပါပြီ။' if enabled else 'ဒီ target chat ထဲမှာ save-only mode OFF ဖြစ်သွားပါပြီ။'}",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     user_id = message.from_user.id
@@ -1607,6 +1863,34 @@ async def waifu_trigger_handler(message: Message, bot: Bot) -> None:
     await handle_lookup_trigger(message, bot)
 
 
+@router.callback_query(F.data == FORCE_JOIN_VERIFY_CALLBACK)
+async def force_join_verify_handler(callback: CallbackQuery, bot: Bot) -> None:
+    user = callback.from_user
+    if not user:
+        await callback.answer()
+        return
+
+    cjoin, gjoin = await refresh_force_join_flags(bot, user.id)
+
+    if cjoin and gjoin:
+        await callback.message.edit_text(
+            build_force_join_success_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_start_keyboard(),
+            disable_web_page_preview=True,
+        )
+        await callback.answer("Verified")
+        return
+
+    await callback.message.edit_text(
+        build_force_join_dm_text(cjoin, gjoin),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_force_join_dm_keyboard(),
+        disable_web_page_preview=True,
+    )
+    await callback.answer("Join required", show_alert=False)
+
+
 # -----------------------------------------------------
 # Media messages
 # -----------------------------------------------------
@@ -1631,20 +1915,31 @@ async def media_handler(message: Message, bot: Bot) -> None:
 
     group_auto_allowed = await should_auto_reply_media_in_chat(message)
 
+    if is_group_chat(message) and not is_default_target_chat(message):
+        if not await ensure_force_join_access(message, bot, group_prompt=False, dm_prompt=False):
+            return
+
     # target group: save-only mode
     if is_default_target_chat(message):
-        if not (user_can_save and autosave_enabled):
+        target_chat_autosave_enabled = await get_target_chat_autosave_mode(message.chat.id)
+
+        if not target_chat_autosave_enabled:
             return
 
         if not (hallow_forward_source or inline_cmd or character_catcher_style_source):
             return
 
         if not parsed.name:
+            await message.reply("name မတွေ့ပါ။ supported post ကို forward / send လုပ်ပါ။")
             return
 
         try:
             meta = await get_media_meta(bot, message)
-            doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=user_id or 0)
+            doc, created = await upsert_item(
+                meta=meta,
+                parsed=parsed,
+                saved_by=user_id or 0,
+            )
 
             source_label = get_autosave_source_label(message)
 
@@ -1661,8 +1956,19 @@ async def media_handler(message: Message, bot: Bot) -> None:
             except Exception:
                 logger.exception("added log send failed")
 
-        except Exception:
+            status = "Saved" if created else "Updated"
+            await message.reply(
+                f"{status}: <b>{html_escape(doc['name'])}</b>\n"
+                f"ID: <b>{html_escape(doc.get('card_id') or '-')}</b>\n"
+                f"Mode: <b>auto-save</b>\n"
+                f"Source: <b>{html_escape(str(source_label))}</b>\n"
+                f"Cmd: <code>{html_escape(doc['command_name'])}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        except Exception as exc:
             logger.exception("target save-only failed")
+            await message.reply(f"target auto-save error: {exc}")
 
         return
 
@@ -1713,6 +2019,9 @@ async def media_handler(message: Message, bot: Bot) -> None:
     if not group_auto_allowed:
         return
 
+    if is_private_chat(message) and not await ensure_force_join_access(message, bot, group_prompt=False, dm_prompt=True):
+        return
+
     if not user_can_use:
         await require_access(message)
         return
@@ -1744,6 +2053,8 @@ async def on_startup(bot: Bot) -> None:
     logger.info("Configured source titles: %s", sorted(SOURCE_CHANNEL_TITLES) if SOURCE_CHANNEL_TITLES else "none")
     logger.info("Configured inline source bots: %s", sorted(INLINE_SOURCE_BOTS) if INLINE_SOURCE_BOTS else "none")
     logger.info("Added log channel: %s", ADDED_LOG_CHANNEL or "none")
+    logger.info("Support channel: %s", SUPPORT_CHANNEL_USERNAME or "none")
+    logger.info("Support group: %s", SUPPORT_GROUP_USERNAME or "none")
     logger.info("Default target chat: %s", DEFAULT_TARGET_CHAT if DEFAULT_TARGET_CHAT is not None else "none")
 
 
