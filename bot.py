@@ -1034,6 +1034,29 @@ async def get_autosave_mode(user_id: Optional[int]) -> bool:
     return bool(row and row.get("autosave_enabled"))
 
 
+async def set_target_chat_autosave_mode(chat_id: int, enabled: bool, updated_by: int) -> None:
+    await settings_col.update_one(
+        {"key": f"target_chat_autosave:{chat_id}"},
+        {
+            "$set": {
+                "key": f"target_chat_autosave:{chat_id}",
+                "chat_id": chat_id,
+                "enabled": enabled,
+                "updated_by": updated_by,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def get_target_chat_autosave_mode(chat_id: Optional[int]) -> bool:
+    if not chat_id:
+        return False
+    row = await settings_col.find_one({"key": f"target_chat_autosave:{chat_id}"})
+    return bool(row and row.get("enabled"))
+
+
 async def find_match(meta: MediaMeta) -> Optional[dict[str, Any]]:
     exact = await items.find_one({"file_unique_id": meta.file_unique_id})
     if exact:
@@ -1426,6 +1449,27 @@ async def autosave_handler(message: Message, command: CommandObject) -> None:
         await message.reply("အသုံးပြုပုံ:\n/autosave on\n/autosave off\n/autosave status")
         return
 
+    if is_default_target_chat(message):
+        chat_id = message.chat.id
+
+        if arg == "status":
+            enabled = await get_target_chat_autosave_mode(chat_id)
+            await message.reply(
+                f"Target Chat Auto-save mode: <b>{'ON' if enabled else 'OFF'}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        enabled = arg == "on"
+        await set_target_chat_autosave_mode(chat_id, enabled, message.from_user.id)
+
+        await message.reply(
+            f"Target Chat Auto-save mode: <b>{'ON' if enabled else 'OFF'}</b>\n"
+            f"{'ဒီ target chat ထဲမှာ save-only mode ON ဖြစ်ပါပြီ။' if enabled else 'ဒီ target chat ထဲမှာ save-only mode OFF ဖြစ်သွားပါပြီ။'}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     user_id = message.from_user.id
 
     if arg == "status":
@@ -1633,18 +1677,25 @@ async def media_handler(message: Message, bot: Bot) -> None:
 
     # target group: save-only mode
     if is_default_target_chat(message):
-        if not (user_can_save and autosave_enabled):
+        target_chat_autosave_enabled = await get_target_chat_autosave_mode(message.chat.id)
+
+        if not target_chat_autosave_enabled:
             return
 
         if not (hallow_forward_source or inline_cmd or character_catcher_style_source):
             return
 
         if not parsed.name:
+            await message.reply("name မတွေ့ပါ။ supported post ကို forward / send လုပ်ပါ။")
             return
 
         try:
             meta = await get_media_meta(bot, message)
-            doc, created = await upsert_item(meta=meta, parsed=parsed, saved_by=user_id or 0)
+            doc, created = await upsert_item(
+                meta=meta,
+                parsed=parsed,
+                saved_by=user_id or 0,
+            )
 
             source_label = get_autosave_source_label(message)
 
@@ -1661,8 +1712,19 @@ async def media_handler(message: Message, bot: Bot) -> None:
             except Exception:
                 logger.exception("added log send failed")
 
-        except Exception:
+            status = "Saved" if created else "Updated"
+            await message.reply(
+                f"{status}: <b>{html_escape(doc['name'])}</b>\n"
+                f"ID: <b>{html_escape(doc.get('card_id') or '-')}</b>\n"
+                f"Mode: <b>auto-save</b>\n"
+                f"Source: <b>{html_escape(str(source_label))}</b>\n"
+                f"Cmd: <code>{html_escape(doc['command_name'])}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        except Exception as exc:
             logger.exception("target save-only failed")
+            await message.reply(f"target auto-save error: {exc}")
 
         return
 
