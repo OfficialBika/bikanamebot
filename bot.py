@@ -75,20 +75,23 @@ SOURCE_CHANNEL_TITLES = {
     if x.strip()
 }
 
-INLINE_SOURCE_BOTS = {
-    x.strip().lstrip("@").lower()
-    for x in os.getenv(
-        "INLINE_SOURCE_BOTS",
-        "@Character_Catcher_Bot,@Character_Seizer_Bot",
-    ).split(",")
-    if x.strip()
+KNOWN_INLINE_SOURCE_COMMAND_MAP: dict[str, str] = {
+    "character_catcher_bot": "/catch",
+    "character_seizer_bot": "/seize",
+    "capturecharacterbot": "/capture",
+    "capture_character_bot": "/capture",
 }
 
-INLINE_SOURCE_COMMAND_MAP: dict[str, str] = {}
-if "character_catcher_bot" in INLINE_SOURCE_BOTS:
-    INLINE_SOURCE_COMMAND_MAP["character_catcher_bot"] = "/catch"
-if "character_seizer_bot" in INLINE_SOURCE_BOTS:
-    INLINE_SOURCE_COMMAND_MAP["character_seizer_bot"] = "/seize"
+INLINE_SOURCE_BOTS = set(KNOWN_INLINE_SOURCE_COMMAND_MAP.keys())
+INLINE_SOURCE_BOTS.update(
+    {
+        x.strip().lstrip("@").lower()
+        for x in os.getenv("INLINE_SOURCE_BOTS", "").split(",")
+        if x.strip()
+    }
+)
+
+INLINE_SOURCE_COMMAND_MAP: dict[str, str] = dict(KNOWN_INLINE_SOURCE_COMMAND_MAP)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -154,7 +157,8 @@ NUMBERED_NAME_RE = re.compile(r"^\s*(\d+)\s*:\s*(.+?)\s*$", re.IGNORECASE | re.M
 SUPPORTED_BOTS = [
     ("hallow", "@Characters_Hallow_bot", ["/hallow"]),
     ("catcher", "@Character_Catcher_Bot", ["/catch"]),
-    ("seizer", "@Character_Seizer_Bot", ["/sezer", "/seize"]),
+    ("seizer", "@Character_Seizer_Bot", ["/seize", "/sezer"]),
+    ("capture", "@CaptureCharacterBot", ["/capture"]),
     ("grab", "@Grab_Your_Waifu_Bot", ["/grab"]),
 ]
 
@@ -782,6 +786,7 @@ def get_source_bot_key_from_command(command_name: str) -> str:
         "/catch": "catcher",
         "/seize": "seizer",
         "/sezer": "seizer",
+        "/capture": "capture",
         "/grab": "grab",
     }
     return mapping.get(cmd, "unknown")
