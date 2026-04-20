@@ -1644,12 +1644,11 @@ async def start_handler(message: Message, command: CommandObject, bot: Bot) -> N
     if await is_allowed_user(message):
         await message.reply(
             "ဒီ bot က photo/video post တွေကို match စစ်ပြီး name ပြန်ထုတ်ပေးပါတယ်。\n\n"
-            "• Approved user: media ကို forward / upload လုပ်တာနဲ့ lookup လုပ်ပေးမယ်\n"
-            "• Group: media ကို reply ထောက်ပြီး /name, /waifu, .wa နဲ့မေးလို့ရမယ်\n"
+            "• Support Group မှာ media ကို forward / upload လုပ်တာနဲ့ lookup လုပ်ပီး name ပေးမယ်\n"
+            "• Group: name သိလိုသော media post ကို reply ထောက်ပြီး /name, /waifu, .name .wa နဲ့မေးလို့ရမယ်\n"
             "• /status: database နဲ့ analytics ကြည့်လို့ရမယ်\n"
             "• Global ON မှာ /gapprove လုပ်ထားတဲ့ group တွေမှာပဲ auto media lookup အလုပ်လုပ်မယ်\n"
-            "• Owner/Sudo: DM ထဲ /autosave on လုပ်ပြီး New post တွေကို Name save/update လုပ်လို့ရမယ်\n"
-            "• Owner/Sudo: /save နဲ့ ပုံ+Name ကို manual save လည်း လုပ်လို့ရပါတယ်",
+            "• Owner/Sudo: /stats cmd ဟာ owner& sudo user အတွက်ပါ",
             reply_markup=keyboard,
         )
         return
