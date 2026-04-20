@@ -75,6 +75,10 @@ SOURCE_CHANNEL_TITLES = {
     for x in os.getenv("SOURCE_CHANNEL_TITLES", "").split(",")
     if x.strip()
 }
+FORWARD_SOURCE_COMMANDS_RAW = os.getenv(
+    "FORWARD_SOURCE_COMMANDS",
+    "@CaptureDatabase:/capture,@Seizer_Database:/seize,CAPTURE|UPLOADS:/capture,SEIZER DATABASE:/seize",
+).strip()
 
 KNOWN_INLINE_SOURCE_COMMAND_MAP: dict[str, str] = {
     "character_catcher_bot": "/catch",
@@ -125,23 +129,25 @@ settings_col = db.settings
 # Helpers
 # -----------------------------------------------------
 NAME_PATTERNS = [
-    re.compile(r"^[^\n\r]*?Character\s*Name\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^[^\n\r]*?\bNAME\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^[^\n\r]*?\bName\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Character\s*Name\s*[:：﹕꞉-]?\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?\bNAME\s*[:：﹕꞉-]?\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?\bName\s*[:：﹕꞉-]?\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 ANIME_PATTERNS = [
-    re.compile(r"^[^\n\r]*?Anime\s*Name\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^[^\n\r]*?Anime\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Anime\s*Name\s*[:：﹕꞉-]?\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Anime\s*[:：﹕꞉-]?\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 RARITY_PATTERNS = [
-    re.compile(r"^[^\n\r]*?Rarity\s*[:：﹕꞉]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Rarity\s*[:：﹕꞉-]?\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 CARD_ID_PATTERNS = [
-    re.compile(r"^[^\n\r]*?ID\s*[:：﹕꞉]\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"^[^\n\r]*?Id\s*[:：﹕꞉]\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Character\s*ID\s*[:：﹕꞉-]?\s*#?\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Card\s*ID\s*[:：﹕꞉-]?\s*#?\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?ID\s*[:：﹕꞉-]?\s*#?\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?Id\s*[:：﹕꞉-]?\s*#?\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 COMMAND_PATTERNS = [
@@ -154,6 +160,21 @@ NAME_TRIGGER_RE = re.compile(r"^(?:\.name|/name)(?:@\w+)?$", re.IGNORECASE)
 WAIFU_TRIGGER_RE = re.compile(r"^(?:\.wa|/waifu)(?:@\w+)?$", re.IGNORECASE)
 CHARACTER_CATCHER_HEADER_RE = re.compile(r"OwO!\s*Check out this character!", re.IGNORECASE)
 NUMBERED_NAME_RE = re.compile(r"^\s*(\d+)\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+SOURCE_NAME_PATTERNS = [
+    re.compile(r"^[^\n\r]*?\bName\b\s*[:：﹕꞉-]?\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?\bCharacter\s*Name\b\s*[:：﹕꞉-]?\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+]
+SOURCE_ANIME_PATTERNS = [
+    re.compile(r"^[^\n\r]*?\bAnime\b\s*[:：﹕꞉-]?\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+]
+SOURCE_RARITY_PATTERNS = [
+    re.compile(r"^[^\n\r]*?\bRarity\b\s*[:：﹕꞉-]?\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+]
+SOURCE_CARD_ID_PATTERNS = [
+    re.compile(r"^[^\n\r]*?\bCharacter\s*ID\b\s*[:：﹕꞉-]?\s*#?\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^[^\n\r]*?\bID\b\s*[:：﹕꞉-]?\s*#?\s*([0-9]+)\s*$", re.IGNORECASE | re.MULTILINE),
+]
+TRAILING_BADGE_RE = re.compile(r"\s*\[([^\[\]]+)\]\s*$")
 
 SUPPORTED_BOTS = [
     ("hallow", "@Characters_Hallow_bot", ["/hallow"]),
@@ -227,6 +248,58 @@ def clean_command_name(value: str) -> str:
         cmd = f"/{cmd.lstrip('/')}"
     return cmd.split()[0]
 
+def normalize_forward_mapping_key(value: str) -> str:
+    return clean_value(value).lstrip("@").casefold()
+
+
+def strip_trailing_badge(value: str) -> str:
+    value = clean_value(value)
+    if not value:
+        return value
+    match = TRAILING_BADGE_RE.search(value)
+    if not match:
+        return value
+    inner = match.group(1)
+    if re.search(r"[A-Za-z0-9]", inner):
+        return value
+    return clean_value(value[: match.start()])
+
+
+def strip_leading_symbols(value: str) -> str:
+    value = clean_value(value)
+    return re.sub(r"^[^\w\u00C0-\u024F\u0400-\u04FF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]+", "", value).strip()
+
+
+def finalize_parsed_text(parsed: ParsedText) -> ParsedText:
+    parsed.name = strip_trailing_badge(strip_leading_symbols(parsed.name or "")) or None
+    parsed.anime_name = strip_trailing_badge(strip_leading_symbols(parsed.anime_name or "")) or None
+    parsed.rarity = strip_leading_symbols(parsed.rarity or "") or None
+    parsed.card_id = clean_value(parsed.card_id or "") or None
+    if parsed.command_name:
+        parsed.command_name = clean_command_name(parsed.command_name)
+    parsed.raw_text = normalize_parse_text(parsed.raw_text)
+    return parsed
+
+
+FORWARD_SOURCE_USERNAME_COMMAND_MAP: dict[str, str] = {}
+FORWARD_SOURCE_TITLE_COMMAND_MAP: dict[str, str] = {}
+
+
+def register_forward_source_command(key: str, command_name: str) -> None:
+    normalized_key = normalize_forward_mapping_key(key)
+    if not normalized_key:
+        return
+    normalized_command = clean_command_name(command_name)
+    if key.strip().startswith("@") or re.fullmatch(r"[A-Za-z0-9_]+", key.strip()):
+        FORWARD_SOURCE_USERNAME_COMMAND_MAP[normalized_key] = normalized_command
+    else:
+        FORWARD_SOURCE_TITLE_COMMAND_MAP[normalized_key] = normalized_command
+
+
+for _mapping in [x.strip() for x in FORWARD_SOURCE_COMMANDS_RAW.split(",") if x.strip() and ":" in x]:
+    _key, _cmd = _mapping.split(":", 1)
+    register_forward_source_command(_key, _cmd)
+
 
 def parse_command_name(text: str) -> Optional[str]:
     raw = unicodedata.normalize("NFKC", normalize_parse_text(text or ""))
@@ -241,13 +314,15 @@ def parse_command_name(text: str) -> Optional[str]:
 
 def parse_caption_text(text: Optional[str]) -> ParsedText:
     raw = normalize_parse_text(text)
-    return ParsedText(
-        name=parse_field(raw, NAME_PATTERNS),
-        anime_name=parse_field(raw, ANIME_PATTERNS),
-        rarity=parse_field(raw, RARITY_PATTERNS),
-        card_id=parse_field(raw, CARD_ID_PATTERNS),
-        command_name=parse_command_name(raw),
-        raw_text=raw,
+    return finalize_parsed_text(
+        ParsedText(
+            name=parse_field(raw, NAME_PATTERNS),
+            anime_name=parse_field(raw, ANIME_PATTERNS),
+            rarity=parse_field(raw, RARITY_PATTERNS),
+            card_id=parse_field(raw, CARD_ID_PATTERNS),
+            command_name=parse_command_name(raw),
+            raw_text=raw,
+        )
     )
 
 
@@ -729,9 +804,33 @@ def get_forward_source_info(message: Message) -> dict[str, Any]:
     return info
 
 
+def get_forward_source_command(message: Message) -> Optional[str]:
+    if not is_forwarded_message(message):
+        return None
+
+    info = get_forward_source_info(message)
+    username = normalize_forward_mapping_key(info.get("username", ""))
+    title = normalize_forward_mapping_key(info.get("title", ""))
+
+    if username and username in FORWARD_SOURCE_USERNAME_COMMAND_MAP:
+        return FORWARD_SOURCE_USERNAME_COMMAND_MAP[username]
+
+    if title and title in FORWARD_SOURCE_TITLE_COMMAND_MAP:
+        return FORWARD_SOURCE_TITLE_COMMAND_MAP[title]
+
+    for key, command_name in FORWARD_SOURCE_TITLE_COMMAND_MAP.items():
+        if key and title and (key in title or title in key):
+            return command_name
+
+    return None
+
+
 def is_allowed_forward_source(message: Message) -> bool:
     if not is_forwarded_message(message):
         return False
+
+    if get_forward_source_command(message):
+        return True
 
     if not SOURCE_CHANNEL_IDS and not SOURCE_CHANNEL_USERNAMES and not SOURCE_CHANNEL_TITLES:
         return True
@@ -784,6 +883,24 @@ def is_hallow_forward_source_message(message: Message) -> bool:
     return is_forwarded_message(message) and is_allowed_forward_source(message)
 
 
+def infer_anime_from_lines(lines: list[str], match_line_index: int) -> Optional[str]:
+    if match_line_index <= 0:
+        return None
+
+    for i in range(match_line_index - 1, -1, -1):
+        line = clean_value(lines[i])
+        if not line:
+            continue
+        if CHARACTER_CATCHER_HEADER_RE.search(line):
+            continue
+        if re.search(r"\b(?:rarity|added\s*by|price|id|character\s*id)\b", line, re.IGNORECASE):
+            continue
+        if re.search(r"new\s+(?:character|waifu)\s+added", line, re.IGNORECASE):
+            continue
+        return strip_trailing_badge(strip_leading_symbols(line)) or None
+    return None
+
+
 def parse_numbered_name_message(message: Message, forced_command: str) -> ParsedText:
     raw = get_combined_message_text(message)
     lines = [clean_value(x) for x in raw.splitlines() if clean_value(x)]
@@ -796,22 +913,37 @@ def parse_numbered_name_message(message: Message, forced_command: str) -> Parsed
     if match:
         card_id = clean_value(match.group(1))
         name = clean_value(match.group(2))
+        match_line = clean_value(match.group(0))
+        if match_line in lines:
+            anime_name = infer_anime_from_lines(lines, lines.index(match_line))
 
-    for i, line in enumerate(lines):
-        line_match = re.match(r"^\s*(\d+)\s*:\s*(.+?)\s*$", line, re.IGNORECASE)
-        if line_match:
-            if i > 0:
-                anime_name = clean_value(lines[i - 1])
-            break
-
-    return ParsedText(
+    parsed = ParsedText(
         name=name,
         anime_name=anime_name,
-        rarity=None,
+        rarity=parse_field(raw, SOURCE_RARITY_PATTERNS) or parse_field(raw, RARITY_PATTERNS),
         card_id=card_id,
         command_name=forced_command,
         raw_text=raw,
     )
+    return finalize_parsed_text(parsed)
+
+
+def parse_forward_source_message(message: Message, forced_command: str) -> ParsedText:
+    raw = get_combined_message_text(message)
+
+    numbered = parse_numbered_name_message(message, forced_command)
+    if numbered.name:
+        return numbered
+
+    parsed = ParsedText(
+        name=parse_field(raw, SOURCE_NAME_PATTERNS) or parse_field(raw, NAME_PATTERNS),
+        anime_name=parse_field(raw, SOURCE_ANIME_PATTERNS) or parse_field(raw, ANIME_PATTERNS),
+        rarity=parse_field(raw, SOURCE_RARITY_PATTERNS) or parse_field(raw, RARITY_PATTERNS),
+        card_id=parse_field(raw, SOURCE_CARD_ID_PATTERNS) or parse_field(raw, CARD_ID_PATTERNS),
+        command_name=forced_command,
+        raw_text=raw,
+    )
+    return finalize_parsed_text(parsed)
 
 
 def get_effective_parsed_message(message: Message) -> ParsedText:
@@ -823,26 +955,38 @@ def get_effective_parsed_message(message: Message) -> ParsedText:
         if inline_parsed.name:
             return inline_parsed
         parsed.command_name = inline_cmd
-        return parsed
+        return finalize_parsed_text(parsed)
+
+    forward_cmd = get_forward_source_command(message)
+    if forward_cmd:
+        forward_parsed = parse_forward_source_message(message, forward_cmd)
+        if forward_parsed.name or forward_parsed.card_id:
+            return forward_parsed
+        parsed.command_name = forward_cmd
+        return finalize_parsed_text(parsed)
 
     if is_character_catcher_style_message(message):
         cc_parsed = parse_numbered_name_message(message, "/catch")
         if cc_parsed.name:
             return cc_parsed
         parsed.command_name = "/catch"
-        return parsed
+        return finalize_parsed_text(parsed)
 
     if is_hallow_forward_source_message(message):
         parsed.command_name = "/hallow"
-        return parsed
+        return finalize_parsed_text(parsed)
 
-    return parsed
+    return finalize_parsed_text(parsed)
 
 
 def get_effective_command_for_message(message: Message, parsed: Optional[ParsedText] = None) -> Optional[str]:
     inline_cmd = get_inline_source_command(message)
     if inline_cmd:
         return inline_cmd
+
+    forward_cmd = get_forward_source_command(message)
+    if forward_cmd:
+        return forward_cmd
 
     if is_character_catcher_style_message(message):
         return "/catch"
@@ -854,7 +998,6 @@ def get_effective_command_for_message(message: Message, parsed: Optional[ParsedT
         return clean_command_name(parsed.command_name)
 
     return None
-
 
 def get_autosave_source_label(message: Message) -> str:
     inline_username = get_inline_source_username(message)
@@ -2052,6 +2195,8 @@ async def on_startup(bot: Bot) -> None:
     logger.info("Configured source usernames: %s", sorted(SOURCE_CHANNEL_USERNAMES) if SOURCE_CHANNEL_USERNAMES else "none")
     logger.info("Configured source titles: %s", sorted(SOURCE_CHANNEL_TITLES) if SOURCE_CHANNEL_TITLES else "none")
     logger.info("Configured inline source bots: %s", sorted(INLINE_SOURCE_BOTS) if INLINE_SOURCE_BOTS else "none")
+    logger.info("Forward source username commands: %s", FORWARD_SOURCE_USERNAME_COMMAND_MAP or "none")
+    logger.info("Forward source title commands: %s", FORWARD_SOURCE_TITLE_COMMAND_MAP or "none")
     logger.info("Added log channel: %s", ADDED_LOG_CHANNEL or "none")
     logger.info("Support channel: %s", SUPPORT_CHANNEL_USERNAME or "none")
     logger.info("Support group: %s", SUPPORT_GROUP_USERNAME or "none")
