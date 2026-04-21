@@ -978,15 +978,21 @@ async def refresh_force_join_flags(bot: Bot, user_id: Optional[int]) -> tuple[bo
 
 
 async def get_force_join_flags_cached(bot: Bot, user_id: int) -> tuple[bool, bool]:
-    row = await known_users.find_one({"user_id": user_id}, {"cjoin": 1, "gjoin": 1, "join_checked_at": 1})
+    row = await known_users.find_one(
+        {"user_id": user_id},
+        {"cjoin": 1, "gjoin": 1, "join_checked_at": 1}
+    )
+
     if row:
-        cjoin = bool(row.get("cjoin"))
-        gjoin = bool(row.get("gjoin"))
         checked_at = row.get("join_checked_at")
-        if cjoin and gjoin and isinstance(checked_at, datetime):
+        if isinstance(checked_at, datetime):
+            if checked_at.tzinfo is None:
+                checked_at = checked_at.replace(tzinfo=timezone.utc)
+
             age = (datetime.now(timezone.utc) - checked_at).total_seconds()
             if age <= FORCE_JOIN_CACHE_SECONDS:
-                return True, True
+                return bool(row.get("cjoin")), bool(row.get("gjoin"))
+
     return await refresh_force_join_flags(bot, user_id)
 
 
