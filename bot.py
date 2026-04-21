@@ -33,6 +33,11 @@ from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from PIL import Image
 
+try:
+    import uvloop  # type: ignore
+except Exception:
+    uvloop = None
+
 load_dotenv()
 
 # -----------------------------------------------------
@@ -1156,6 +1161,16 @@ async def get_media_meta(bot: Bot, message: Message) -> MediaMeta:
     )
 
 
+def get_exact_snapshot_match(message: Message) -> Optional[dict[str, Any]]:
+    media_type, media = extract_media_handle(message)
+    if not media_type or not media:
+        return None
+    file_unique_id = getattr(media, "file_unique_id", "") or ""
+    if not file_unique_id:
+        return None
+    return SNAPSHOT.by_file_unique_id.get(file_unique_id)
+
+
 def result_cache_key(meta: MediaMeta, command_hints: Optional[list[str]] = None) -> str:
     hint_key = ",".join(dedupe_commands(list(command_hints or [])))
     return f"{meta.media_type}|{meta.file_unique_id}|{meta.sha256}|{hint_key}"
@@ -1489,10 +1504,13 @@ async def send_not_found(message: Message) -> None:
 async def lookup_and_reply(reply_message: Message, target_media_message: Message, bot: Bot, command_candidates: Optional[list[str]] = None) -> None:
     started = time.perf_counter()
     matched = None
+    command_candidates = dedupe_commands(list(command_candidates or []))
     primary_command = clean_command_name(command_candidates[0]) if command_candidates else None
     try:
-        meta = await get_media_meta(bot, target_media_message)
-        matched = await find_match(meta, command_hints=command_candidates)
+        matched = get_exact_snapshot_match(target_media_message)
+        if not matched:
+            meta = await get_media_meta(bot, target_media_message)
+            matched = await find_match(meta, command_hints=command_candidates)
         if matched:
             await send_found_result(reply_message, matched, override_command_name=primary_command)
         else:
@@ -1902,6 +1920,8 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try:
+        if uvloop is not None:
+            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped")
