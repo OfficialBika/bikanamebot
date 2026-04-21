@@ -1242,7 +1242,6 @@ async def build_status_text() -> str:
         f"‣ Snapshot Items : <b>{SNAPSHOT.count}</b>",
         f"‣ Snapshot Age : <b>{int(SNAPSHOT.age_seconds())}s</b>",
         f"‣ Result Cache : <b>{len(RESULT_CACHE.data)}</b>",
-        f"‣ Latency : <b>{perf['lookup_ema_ms']:.2f}ms</b>",
         "",
         "🎮 <b>Saved Media By Cmd</b>",
         *saved_by_cmd_lines,
@@ -1506,7 +1505,7 @@ async def start_handler(message: Message, command: CommandObject, bot: Bot) -> N
         await message.reply(
             "ဒီ bot က photo/video post တွေကို match စစ်ပြီး name ပြန်ထုတ်ပေးပါတယ်。\n\n"
             "• DM: photo/video ပို့လိုက်တာနဲ့ lookup လုပ်ပေးမယ်\n"
-            "• Group: media ကို reply ထောက်ပြီး /name, /waifu, .wa နဲ့မေးလို့ရမယ်\n"
+            "• Group: media ကို reply ထောက်ပြီး /name, /waifu, .name,  .wa နဲ့မေးလို့ရမယ်\n"
             "• /status: database နဲ့ analytics ကြည့်လို့ရမယ်\n"
             "• Global ON မှာ /gapprove လုပ်ထားတဲ့ group တွေမှာပဲ auto media lookup အလုပ်လုပ်မယ်",
             reply_markup=keyboard,
