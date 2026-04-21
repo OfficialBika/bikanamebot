@@ -1268,8 +1268,8 @@ async def build_status_text() -> str:
     lines = [
         "♻ <b>LOOKUP BOT STATUS</b>",
         f"‣ Total Media : <b>{total_media}</b>",
-        f"‣ Known Users : <b>{total_users}</b>",
-        f"‣ Known Groups : <b>{total_groups}</b>",
+        f"‣ Total Users : <b>{total_users}</b>",
+        f"‣ Total Groups : <b>{total_groups}</b>",
         f"‣ GApproved Groups : <b>{gapproved_count}</b>",
         f"‣ Blacklisted Users : <b>{blacklisted_count}</b>",
         f"‣ Global Mode : <b>{'ON' if global_mode else 'OFF'}</b>",
@@ -1278,7 +1278,6 @@ async def build_status_text() -> str:
         f"‣ Snapshot Items : <b>{SNAPSHOT.count}</b>",
         f"‣ Snapshot Age : <b>{int(SNAPSHOT.age_seconds())}s</b>",
         f"‣ Result Cache : <b>{len(RESULT_CACHE.data)}</b>",
-        f"‣ Latency : <b>{perf['lookup_ema_ms']:.2f}ms</b>",
         "",
         "🎮 <b>Saved Media By Cmd</b>",
         *saved_by_cmd_lines,
