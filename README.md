@@ -30,10 +30,7 @@ Python Telegram bot for:
 - `/start`
 
 ### Owner only
-- `/approve` by reply
-- `/approve @username`
-- `/approve userID`
-- `/addsudo` by reply
+- `/gapprove`
 - `/addsudo @username`
 - `/addsudo userID`
 - `/rmsudo` by reply
@@ -41,9 +38,6 @@ Python Telegram bot for:
 - `/rmsudo userID`
 - `/stats`
 
-### Owner + sudo
-- `/save` on replied media
-- auto-save on forwarded media with name in caption/text
 
 ## Environment
 
@@ -77,4 +71,4 @@ python bot.py
 - Best results come from forwarding the **original media**.
 - Exact matching uses `file_unique_id` and `sha256`.
 - Fuzzy matching uses `pHash` for photos and sampled frame hashes for videos.
-- `/approve @username` works best after the user has already talked to the bot once, because the bot stores known usernames locally.
+
