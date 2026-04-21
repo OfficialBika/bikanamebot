@@ -33,11 +33,6 @@ from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from PIL import Image
 
-try:
-    import uvloop  # type: ignore
-except Exception:
-    uvloop = None
-
 load_dotenv()
 
 # -----------------------------------------------------
@@ -87,7 +82,7 @@ FORWARD_SOURCE_COMMANDS_RAW = os.getenv(
 SNAPSHOT_REFRESH_SECONDS = int(os.getenv("SNAPSHOT_REFRESH_SECONDS", "60"))
 RESULT_CACHE_MAX_ITEMS = int(os.getenv("RESULT_CACHE_MAX_ITEMS", "3000"))
 RESULT_CACHE_TTL_SECONDS = int(os.getenv("RESULT_CACHE_TTL_SECONDS", "600"))
-FORCE_JOIN_CACHE_SECONDS = int(os.getenv("FORCE_JOIN_CACHE_SECONDS", "259200"))
+FORCE_JOIN_CACHE_SECONDS = int(os.getenv("FORCE_JOIN_CACHE_SECONDS", "300"))
 MISS_REFRESH_COOLDOWN_SECONDS = int(os.getenv("MISS_REFRESH_COOLDOWN_SECONDS", "15"))
 
 MODE = os.getenv("MODE", "auto").strip().lower()  # auto|polling|webhook
@@ -120,11 +115,13 @@ logger = logging.getLogger("bikanamebot")
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[DB_NAME]
 items = db.items
+approved_users = db.approved_users
 sudo_users = db.sudo_users
 blacklisted_users = db.blacklisted_users
 known_users = db.known_users
 known_groups = db.known_groups
 gapproved_groups = db.gapproved_groups
+settings_col = db.settings
 
 # -----------------------------------------------------
 # Patterns / helpers
@@ -334,14 +331,13 @@ class ItemSnapshot:
                 if sha256_value:
                     by_sha256[sha256_value] = row
 
-                command_aliases = get_command_aliases(row.get("command_name") or DEFAULT_COMMAND) or [DEFAULT_COMMAND]
+                command_name = clean_command_name(row.get("command_name") or DEFAULT_COMMAND)
 
                 if row.get("media_type") == "photo" and row.get("phash"):
                     try:
                         phash_int = int(str(row["phash"]), 16)
                         photos.append((phash_int, row))
-                        for command_name in command_aliases:
-                            photos_by_command[command_name].append((phash_int, row))
+                        photos_by_command[command_name].append((phash_int, row))
                     except Exception:
                         pass
 
@@ -350,8 +346,7 @@ class ItemSnapshot:
                         frame_ints = [int(str(h), 16) for h in list(row["frame_hashes"]) if h]
                         if frame_ints:
                             videos.append((frame_ints, row))
-                            for command_name in command_aliases:
-                                videos_by_command[command_name].append((frame_ints, row))
+                            videos_by_command[command_name].append((frame_ints, row))
                     except Exception:
                         pass
 
@@ -427,67 +422,6 @@ def clean_command_name(value: str) -> str:
     return cmd.split()[0]
 
 
-def dedupe_commands(commands: list[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for value in commands:
-        if not value:
-            continue
-        cmd = clean_command_name(value)
-        key = cmd.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        ordered.append(cmd)
-    return ordered
-
-
-def build_command_alias_index() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-    groups: dict[str, list[str]] = {}
-    index: dict[str, list[str]] = {}
-    for _key, _bot, commands in SUPPORTED_BOTS:
-        canonical = clean_command_name(commands[0])
-        aliases = dedupe_commands(commands)
-        groups[canonical] = aliases
-        for alias in aliases:
-            index[alias.casefold()] = aliases
-            index[alias.lstrip('/').casefold()] = aliases
-    return groups, index
-
-
-COMMAND_ALIAS_GROUPS, COMMAND_ALIAS_INDEX = build_command_alias_index()
-
-
-def get_command_aliases(value: Optional[str]) -> list[str]:
-    if not value:
-        return []
-    cmd = clean_command_name(value)
-    aliases = COMMAND_ALIAS_GROUPS.get(cmd)
-    return list(aliases) if aliases else [cmd]
-
-
-def extract_command_candidates(text: Optional[str]) -> list[str]:
-    raw = unicodedata.normalize("NFKC", normalize_parse_text(text or ""))
-    if not raw:
-        return []
-
-    candidates: list[str] = []
-    for pattern in COMMAND_PATTERNS:
-        for match in pattern.finditer(raw):
-            key = clean_value(match.group(1)).casefold().lstrip('/')
-            aliases = COMMAND_ALIAS_INDEX.get(key) or COMMAND_ALIAS_INDEX.get(f"/{key}")
-            if aliases:
-                candidates.extend(aliases)
-
-    for match in re.finditer(r"(?<!\w)/?([A-Za-z][A-Za-z0-9_]{1,31})\b", raw):
-        key = clean_value(match.group(1)).casefold().lstrip('/')
-        aliases = COMMAND_ALIAS_INDEX.get(key) or COMMAND_ALIAS_INDEX.get(f"/{key}")
-        if aliases:
-            candidates.extend(aliases)
-
-    return dedupe_commands(candidates)
-
-
 def normalize_forward_mapping_key(value: str) -> str:
     return clean_value(value).lstrip("@").casefold()
 
@@ -551,8 +485,12 @@ for _mapping in [x.strip() for x in FORWARD_SOURCE_COMMANDS_RAW.split(",") if x.
 # Parsing
 # -----------------------------------------------------
 def parse_command_name(text: str) -> Optional[str]:
-    candidates = extract_command_candidates(text)
-    return candidates[0] if candidates else None
+    raw = unicodedata.normalize("NFKC", normalize_parse_text(text or ""))
+    for pattern in COMMAND_PATTERNS:
+        match = pattern.search(raw)
+        if match:
+            return clean_command_name("/" + match.group(1))
+    return None
 
 
 def parse_caption_text(text: Optional[str]) -> ParsedText:
@@ -862,30 +800,20 @@ def get_effective_parsed_message(message: Message) -> ParsedText:
     return finalize_parsed_text(parsed)
 
 
-def get_effective_command_candidates_for_message(message: Message, parsed: Optional[ParsedText] = None) -> list[str]:
-    candidates: list[str] = []
-
+def get_effective_command_for_message(message: Message, parsed: Optional[ParsedText] = None) -> Optional[str]:
     inline_cmd = get_inline_source_command(message)
     if inline_cmd:
-        candidates.extend(get_command_aliases(inline_cmd))
-
+        return inline_cmd
     forward_cmd = get_forward_source_command(message)
     if forward_cmd:
-        candidates.extend(get_command_aliases(forward_cmd))
-
+        return forward_cmd
     if is_character_catcher_style_message(message):
-        candidates.extend(get_command_aliases("/catch"))
-
+        return "/catch"
     if is_hallow_forward_source_message(message):
-        candidates.extend(get_command_aliases("/hallow"))
-
-    for raw in collect_candidate_texts(message):
-        candidates.extend(extract_command_candidates(raw))
-
+        return "/hallow"
     if parsed and parsed.command_name:
-        candidates.extend(get_command_aliases(parsed.command_name))
-
-    return dedupe_commands(candidates)
+        return clean_command_name(parsed.command_name)
+    return None
 
 
 def is_group_auto_lookup_source_message(message: Message) -> bool:
@@ -1017,24 +945,48 @@ async def check_single_support_membership(bot: Bot, user_id: int, chat_ref: Opti
 async def refresh_force_join_flags(bot: Bot, user_id: Optional[int]) -> tuple[bool, bool]:
     if not user_id:
         return True, True
+
     cjoin = await check_single_support_membership(bot, user_id, support_chat_ref(SUPPORT_CHANNEL_USERNAME))
     gjoin = await check_single_support_membership(bot, user_id, support_chat_ref(SUPPORT_GROUP_USERNAME))
-    await known_users.update_one(
-        {"user_id": user_id},
-        {"$set": {"cjoin": bool(cjoin), "gjoin": bool(gjoin), "join_checked_at": datetime.now(timezone.utc)}},
-        upsert=True,
-    )
+
+    if cjoin and gjoin:
+        await known_users.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "cjoin": True,
+                    "gjoin": True,
+                    "join_checked_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+    else:
+        await known_users.update_one(
+            {"user_id": user_id},
+            {
+                "$unset": {
+                    "cjoin": "",
+                    "gjoin": "",
+                    "join_checked_at": "",
+                }
+            },
+            upsert=True,
+        )
+
     return bool(cjoin), bool(gjoin)
 
 
 async def get_force_join_flags_cached(bot: Bot, user_id: int) -> tuple[bool, bool]:
     row = await known_users.find_one({"user_id": user_id}, {"cjoin": 1, "gjoin": 1, "join_checked_at": 1})
     if row:
+        cjoin = bool(row.get("cjoin"))
+        gjoin = bool(row.get("gjoin"))
         checked_at = row.get("join_checked_at")
-        if isinstance(checked_at, datetime):
+        if cjoin and gjoin and isinstance(checked_at, datetime):
             age = (datetime.now(timezone.utc) - checked_at).total_seconds()
             if age <= FORCE_JOIN_CACHE_SECONDS:
-                return bool(row.get("cjoin")), bool(row.get("gjoin"))
+                return True, True
     return await refresh_force_join_flags(bot, user_id)
 
 
@@ -1161,19 +1113,8 @@ async def get_media_meta(bot: Bot, message: Message) -> MediaMeta:
     )
 
 
-def get_exact_snapshot_match(message: Message) -> Optional[dict[str, Any]]:
-    media_type, media = extract_media_handle(message)
-    if not media_type or not media:
-        return None
-    file_unique_id = getattr(media, "file_unique_id", "") or ""
-    if not file_unique_id:
-        return None
-    return SNAPSHOT.by_file_unique_id.get(file_unique_id)
-
-
-def result_cache_key(meta: MediaMeta, command_hints: Optional[list[str]] = None) -> str:
-    hint_key = ",".join(dedupe_commands(list(command_hints or [])))
-    return f"{meta.media_type}|{meta.file_unique_id}|{meta.sha256}|{hint_key}"
+def result_cache_key(meta: MediaMeta, command_hint: Optional[str] = None) -> str:
+    return f"{meta.media_type}|{meta.file_unique_id}|{meta.sha256}|{clean_command_name(command_hint or '')}"
 
 
 async def measure_db_ping_ms() -> float:
@@ -1205,9 +1146,8 @@ async def maybe_refresh_snapshot_on_miss() -> None:
         logger.exception("miss-triggered snapshot refresh failed")
 
 
-async def find_match(meta: MediaMeta, command_hints: Optional[list[str]] = None) -> Optional[dict[str, Any]]:
-    normalized_hints = dedupe_commands(list(command_hints or []))
-    cache_key = result_cache_key(meta, normalized_hints)
+async def find_match(meta: MediaMeta, command_hint: Optional[str] = None) -> Optional[dict[str, Any]]:
+    cache_key = result_cache_key(meta, command_hint)
     cached = await RESULT_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -1222,6 +1162,7 @@ async def find_match(meta: MediaMeta, command_hints: Optional[list[str]] = None)
         await RESULT_CACHE.set(cache_key, matched)
         return matched
 
+    hint_cmd = clean_command_name(command_hint or "") if command_hint else ""
     best_item: Optional[dict[str, Any]] = None
 
     if meta.media_type == "photo" and meta.phash:
@@ -1231,9 +1172,8 @@ async def find_match(meta: MediaMeta, command_hints: Optional[list[str]] = None)
             meta_hash_int = None
         if meta_hash_int is not None:
             candidate_lists = []
-            for hint_cmd in normalized_hints:
-                if SNAPSHOT.photos_by_command.get(hint_cmd):
-                    candidate_lists.append(SNAPSHOT.photos_by_command[hint_cmd])
+            if hint_cmd and SNAPSHOT.photos_by_command.get(hint_cmd):
+                candidate_lists.append(SNAPSHOT.photos_by_command[hint_cmd])
             candidate_lists.append(SNAPSHOT.photos)
 
             seen = set()
@@ -1264,9 +1204,8 @@ async def find_match(meta: MediaMeta, command_hints: Optional[list[str]] = None)
             meta_frame_ints = []
         if meta_frame_ints:
             candidate_lists = []
-            for hint_cmd in normalized_hints:
-                if SNAPSHOT.videos_by_command.get(hint_cmd):
-                    candidate_lists.append(SNAPSHOT.videos_by_command[hint_cmd])
+            if hint_cmd and SNAPSHOT.videos_by_command.get(hint_cmd):
+                candidate_lists.append(SNAPSHOT.videos_by_command[hint_cmd])
             candidate_lists.append(SNAPSHOT.videos)
 
             seen = set()
@@ -1303,16 +1242,27 @@ async def count_media_for_bot_key(key: str, commands: list[str]) -> int:
 
 
 async def build_status_text() -> str:
-    total_media, total_users, total_groups, gapproved_count, blacklisted_count = await asyncio.gather(
+    (
+        total_media,
+        total_users,
+        total_groups,
+        gapproved_count,
+        blacklisted_count,
+        global_mode,
+    ) = await asyncio.gather(
         asyncio.sleep(0, result=SNAPSHOT.count or 0),
         known_users.count_documents({}),
         known_groups.count_documents({}),
         gapproved_groups.count_documents({}),
         blacklisted_users.count_documents({}),
+        get_global_mode(),
     )
 
     bot_counts = await asyncio.gather(*[count_media_for_bot_key(key, commands) for key, _bot, commands in SUPPORTED_BOTS])
+
     saved_by_cmd_lines = [f"‣ {html_escape(commands[0])} : <b>{count}</b>" for count, (_key, _bot, commands) in zip(bot_counts, SUPPORTED_BOTS)]
+    supported_lines = [f"{idx}. {html_escape(bot_username)} : <b>{count}</b>" for idx, (count, (_key, bot_username, _commands)) in enumerate(zip(bot_counts, SUPPORTED_BOTS), start=1)]
+
     perf = await PERF.snapshot()
 
     lines = [
@@ -1322,20 +1272,21 @@ async def build_status_text() -> str:
         f"‣ Known Groups : <b>{total_groups}</b>",
         f"‣ GApproved Groups : <b>{gapproved_count}</b>",
         f"‣ Blacklisted Users : <b>{blacklisted_count}</b>",
-        f"‣ Force Join : <b>{'ON' if force_join_enabled() else 'OFF'}</b>",
+        f"‣ Global Mode : <b>{'ON' if global_mode else 'OFF'}</b>",
         "",
         "⚡ <b>LOOKUP ENGINE</b>",
         f"‣ Snapshot Items : <b>{SNAPSHOT.count}</b>",
         f"‣ Snapshot Age : <b>{int(SNAPSHOT.age_seconds())}s</b>",
         f"‣ Result Cache : <b>{len(RESULT_CACHE.data)}</b>",
-        f"‣ Avg Latency : <b>{perf['lookup_ema_ms']:.2f}ms</b>",
-        f"‣ Cache Hit Rate : <b>{perf['lookup_hit_rate']:.2f}%</b>",
+        f"‣ Latency : <b>{perf['lookup_ema_ms']:.2f}ms</b>",
         "",
         "🎮 <b>Saved Media By Cmd</b>",
         *saved_by_cmd_lines,
+        "",
+        "🤖 <b>Supported Bot List</b>",
+        *supported_lines,
     ]
     return "\n".join(lines)
-
 
 # -----------------------------------------------------
 # DB / auth helpers
@@ -1345,8 +1296,8 @@ async def ensure_indexes() -> None:
     await items.create_index("sha256", unique=True, sparse=True)
     await items.create_index("media_type")
     await items.create_index("command_name")
-    await items.create_index([("command_name", 1), ("media_type", 1)])
     await items.create_index("source_bot_key")
+    await approved_users.create_index("user_id", unique=True)
     await sudo_users.create_index("user_id", unique=True)
     await blacklisted_users.create_index("user_id", unique=True)
     await known_users.create_index("user_id", unique=True)
@@ -1354,6 +1305,7 @@ async def ensure_indexes() -> None:
     await known_groups.create_index("chat_id", unique=True)
     await known_groups.create_index("username")
     await gapproved_groups.create_index("chat_id", unique=True)
+    await settings_col.create_index("key", unique=True)
 
 
 async def remember_user(message: Message) -> None:
@@ -1386,16 +1338,12 @@ async def remember_chat(message: Message) -> None:
         )
 
 
-async def is_owner_user(user_id: Optional[int]) -> bool:
-    return bool(user_id and user_id in OWNER_IDS)
-
-
 async def is_sudo_user(user_id: Optional[int]) -> bool:
     return bool(user_id and await sudo_users.find_one({"user_id": user_id}, {"_id": 1}))
 
 
-async def is_admin_user(user_id: Optional[int]) -> bool:
-    return bool(user_id) and (await is_owner_user(user_id) or await is_sudo_user(user_id))
+async def is_approved_user(user_id: Optional[int]) -> bool:
+    return bool(user_id and await approved_users.find_one({"user_id": user_id}, {"_id": 1}))
 
 
 async def is_blacklisted_user(user_id: Optional[int]) -> bool:
@@ -1424,15 +1372,48 @@ async def set_group_approval(chat, approved_by: int, enabled: bool) -> None:
         await gapproved_groups.delete_one({"chat_id": chat.id})
 
 
-async def can_use_lookup(message: Message) -> bool:
+async def set_global_mode(enabled: bool, updated_by: int) -> None:
+    await settings_col.update_one(
+        {"key": "global_mode"},
+        {"$set": {"key": "global_mode", "enabled": enabled, "updated_by": updated_by, "updated_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+
+
+async def get_global_mode() -> bool:
+    row = await settings_col.find_one({"key": "global_mode"})
+    return bool(row and row.get("enabled"))
+
+
+async def is_allowed_user(message: Message) -> bool:
     user_id = message.from_user.id if message.from_user else None
-    return bool(user_id) and not await is_blacklisted_user(user_id)
-
-
-async def require_lookup_access(message: Message) -> bool:
-    if await can_use_lookup(message):
+    if not user_id:
+        return False
+    if await is_blacklisted_user(user_id):
+        return False
+    if user_id in OWNER_IDS:
         return True
-    await message.reply("You are blacklisted from using this bot.")
+    if await is_sudo_user(user_id):
+        return True
+    if await get_global_mode():
+        return True
+    if await is_approved_user(user_id):
+        return True
+    return False
+
+
+async def require_access(message: Message) -> bool:
+    if await is_allowed_user(message):
+        return True
+    user_id = message.from_user.id if message.from_user else None
+    if await is_blacklisted_user(user_id):
+        await message.reply("You are blacklisted from using this bot.")
+        return False
+    if await get_global_mode():
+        return True
+    await message.reply(
+        "ဒီ bot ကိုသုံးဖို့ owner approval လိုပါတယ်。\nOwner ကို Legendary 1 card ပေးပြီး approve လုပ်ခိုင်းပါ။"
+    )
     return False
 
 
@@ -1501,18 +1482,14 @@ async def send_not_found(message: Message) -> None:
     await message.reply("Unknown!\nဒီ Media Name ကို owner က save မလုပ်ရသေးတာ ဖြစ်နိုင်ပါတယ်။")
 
 
-async def lookup_and_reply(reply_message: Message, target_media_message: Message, bot: Bot, command_candidates: Optional[list[str]] = None) -> None:
+async def lookup_and_reply(reply_message: Message, target_media_message: Message, bot: Bot, override_command_name: Optional[str] = None) -> None:
     started = time.perf_counter()
     matched = None
-    command_candidates = dedupe_commands(list(command_candidates or []))
-    primary_command = clean_command_name(command_candidates[0]) if command_candidates else None
     try:
-        matched = get_exact_snapshot_match(target_media_message)
-        if not matched:
-            meta = await get_media_meta(bot, target_media_message)
-            matched = await find_match(meta, command_hints=command_candidates)
+        meta = await get_media_meta(bot, target_media_message)
+        matched = await find_match(meta, command_hint=override_command_name)
         if matched:
-            await send_found_result(reply_message, matched, override_command_name=primary_command)
+            await send_found_result(reply_message, matched, override_command_name=override_command_name)
         else:
             await send_not_found(reply_message)
     finally:
@@ -1532,8 +1509,8 @@ async def handle_lookup_trigger(message: Message, bot: Bot) -> None:
     asyncio.create_task(remember_chat(message))
     if not await ensure_force_join_access(message, bot, group_prompt=True, dm_prompt=True):
         return
-    if not await can_use_lookup(message):
-        await require_lookup_access(message)
+    if not await is_allowed_user(message):
+        await require_access(message)
         return
     target = message.reply_to_message
     if not target:
@@ -1544,11 +1521,9 @@ async def handle_lookup_trigger(message: Message, bot: Bot) -> None:
         await message.reply("photo/video message ကို reply ထောက်ပြီး /name, /waifu သို့ .wa သုံးပါ")
         return
     parsed_target = get_effective_parsed_message(target)
-    command_candidates = get_effective_command_candidates_for_message(target, parsed_target)
-    if not command_candidates and message.reply_to_message:
-        command_candidates = get_effective_command_candidates_for_message(message, get_effective_parsed_message(message))
+    override_cmd = get_effective_command_for_message(target, parsed_target)
     try:
-        await lookup_and_reply(message, target, bot, command_candidates=command_candidates)
+        await lookup_and_reply(message, target, bot, override_command_name=override_cmd)
     except Exception as exc:
         logger.exception("reply lookup failed")
         await message.reply(f"စစ်ဆေးရာမှာ error ဖြစ်နေပါတယ်: {exc}")
@@ -1561,18 +1536,23 @@ async def start_handler(message: Message, command: CommandObject, bot: Bot) -> N
     asyncio.create_task(remember_chat(message))
     if force_join_enabled() and not await ensure_force_join_access(message, bot, group_prompt=True, dm_prompt=True):
         return
-    if not await can_use_lookup(message):
-        await require_lookup_access(message)
-        return
-
     keyboard = build_start_keyboard()
+    if await is_allowed_user(message):
+        await message.reply(
+            "ဒီ bot က photo/video post တွေကို match စစ်ပြီး name ပြန်ထုတ်ပေးပါတယ်。\n\n"
+            "• DM: photo/video ပို့လိုက်တာနဲ့ lookup လုပ်ပေးမယ်\n"
+            "• Group: media ကို reply ထောက်ပြီး /name, /waifu, .wa နဲ့မေးလို့ရမယ်\n"
+            "• /status: database နဲ့ analytics ကြည့်လို့ရမယ်\n"
+            "• Global ON ဖြစ်ရင် group အားလုံးမှာ .name / /name / .wa / /waifu ကို သုံးလို့ရမယ်\n"
+            "• Auto media lookup က /gapprove လုပ်ထားတဲ့ group တွေမှာပဲ အလုပ်လုပ်မယ်",
+            reply_markup=keyboard,
+        )
+        return
+    if await get_global_mode():
+        await message.reply("Global mode ON ဖြစ်နေပါတယ်။ ဘယ်သူမဆို သုံးလို့ရပါတယ်။", reply_markup=keyboard)
+        return
     await message.reply(
-        "ဒီ bot က photo/video post တွေကို fast match စစ်ပြီး name ပြန်ထုတ်ပေးပါတယ်。\n\n"
-        "• DM: photo/video ပို့လိုက်တာနဲ့ lookup လုပ်ပေးမယ်\n"
-        "• Group: media ကို reply ထောက်ပြီး /name, /waifu, .wa, .name နဲ့မေးလို့ရမယ်\n"
-        "• Auto lookup က /gapprove လုပ်ထားတဲ့ group တွေမှာ source post တွေအတွက်ပဲ အလုပ်လုပ်မယ်\n"
-        "• Force join pass ဖြစ်ရင် normal user တွေလည်း သုံးလို့ရမယ်\n"
-        "• /status: current database + engine status ကြည့်လို့ရမယ်",
+        "ဒီ bot ကိုသုံးဖို့ approval လိုပါတယ်。\nOwner ကို Legendary 1 card ပေးပြီး approve လုပ်ခိုင်းပါ။",
         reply_markup=keyboard,
     )
 
@@ -1582,8 +1562,8 @@ async def status_command(message: Message, bot: Bot) -> None:
     asyncio.create_task(remember_chat(message))
     if not await ensure_force_join_access(message, bot, group_prompt=True, dm_prompt=True):
         return
-    if not await can_use_lookup(message):
-        await require_lookup_access(message)
+    if not await is_allowed_user(message):
+        await require_access(message)
         return
     await message.reply(await build_status_text(), parse_mode=ParseMode.HTML)
 
@@ -1592,7 +1572,7 @@ async def status_command(message: Message, bot: Bot) -> None:
 async def stats_handler(message: Message) -> None:
     asyncio.create_task(remember_chat(message))
     user_id = message.from_user.id if message.from_user else None
-    if not await is_admin_user(user_id):
+    if not user_id or (user_id not in OWNER_IDS and not await is_sudo_user(user_id)):
         return
 
     db_ping_task = asyncio.create_task(measure_db_ping_ms())
@@ -1600,15 +1580,17 @@ async def stats_handler(message: Message) -> None:
         asyncio.sleep(0, result=SNAPSHOT.count or 0),
         items.count_documents({"media_type": "photo"}),
         items.count_documents({"media_type": "video"}),
+        approved_users.count_documents({}),
         sudo_users.count_documents({}),
         known_users.count_documents({}),
         known_groups.count_documents({}),
         blacklisted_users.count_documents({}),
         gapproved_groups.count_documents({}),
+        get_global_mode(),
     )
     perf_task = asyncio.create_task(PERF.snapshot())
 
-    total, photos, videos, sudos, users, groups, blacklisted, gapproved_count = await counts_task
+    total, photos, videos, approved, sudos, users, groups, blacklisted, gapproved_count, global_mode = await counts_task
     db_ping_ms = await db_ping_task
     perf = await perf_task
 
@@ -1619,10 +1601,11 @@ async def stats_handler(message: Message) -> None:
         f"‣ Videos: <b>{videos}</b>\n"
         f"‣ Total Users: <b>{users}</b>\n"
         f"‣ Total Groups: <b>{groups}</b>\n"
+        f"‣ Approved Users: <b>{approved}</b>\n"
         f"‣ Sudo Users: <b>{sudos}</b>\n"
         f"‣ Blacklisted: <b>{blacklisted}</b>\n"
         f"‣ GApproved Groups: <b>{gapproved_count}</b>\n"
-        f"‣ Force Join: <b>{'ON' if force_join_enabled() else 'OFF'}</b>\n"
+        f"‣ Global Mode: <b>{'ON' if global_mode else 'OFF'}</b>\n"
         f"‣ Snapshot Age: <b>{int(SNAPSHOT.age_seconds())}s</b>\n\n"
         f"⚙️ <b>PERFORMANCE</b>\n"
         f"‣ Latency : <b>{perf['lookup_ema_ms']:.2f}ms</b>\n"
@@ -1635,16 +1618,42 @@ async def stats_handler(message: Message) -> None:
     )
 
 
+@router.message(Command("global"))
+async def global_handler(message: Message, command: CommandObject) -> None:
+    asyncio.create_task(remember_chat(message))
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
+        return
+    arg = clean_value(command.args or "").lower()
+    if arg not in {"on", "off", "status"}:
+        enabled = await get_global_mode()
+        await message.reply(
+            "အသုံးပြုပုံ:\n/global on\n/global off\n/global status\n\n"
+            f"Current: <b>{'ON' if enabled else 'OFF'}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if arg == "status":
+        enabled = await get_global_mode()
+        await message.reply(f"Global mode: <b>{'ON' if enabled else 'OFF'}</b>", parse_mode=ParseMode.HTML)
+        return
+    enabled = arg == "on"
+    await set_global_mode(enabled, message.from_user.id)
+    await message.reply(
+        f"Global mode: <b>{'ON' if enabled else 'OFF'}</b>\n"
+        f"{'DM နဲ့ group အားလုံးမှာ .name / /name / .wa / /waifu ကို all user သုံးလို့ရမယ်။ Auto media lookup က /gapprove group တွေမှာပဲ အလုပ်လုပ်မယ်။' if enabled else 'DM & Group တိုင်းမှာ approve user / sudo ပဲ bot ကို သုံးလို့ရပါမယ်။'}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @router.message(Command("gapprove"))
 async def gapprove_handler(message: Message) -> None:
     asyncio.create_task(remember_chat(message))
-    user_id = message.from_user.id if message.from_user else None
-    if not await is_admin_user(user_id):
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
     if not is_group_chat(message):
         await message.reply("/gapprove ကို approve လုပ်ချင်တဲ့ group ထဲမှာပဲ သုံးပါ")
         return
-    await set_group_approval(message.chat, user_id, True)
+    await set_group_approval(message.chat, message.from_user.id, True)
     await message.reply(
         f"Group approved for auto media lookup: <b>{html_escape(clean_value(getattr(message.chat, 'title', '') or str(message.chat.id)))}</b>",
         parse_mode=ParseMode.HTML,
@@ -1654,13 +1663,12 @@ async def gapprove_handler(message: Message) -> None:
 @router.message(Command("grmapprove"))
 async def grmapprove_handler(message: Message) -> None:
     asyncio.create_task(remember_chat(message))
-    user_id = message.from_user.id if message.from_user else None
-    if not await is_admin_user(user_id):
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
     if not is_group_chat(message):
         await message.reply("/grmapprove ကို group ထဲမှာပဲ သုံးပါ")
         return
-    await set_group_approval(message.chat, user_id, False)
+    await set_group_approval(message.chat, message.from_user.id, False)
     await message.reply(
         f"Group auto media lookup removed: <b>{html_escape(clean_value(getattr(message.chat, 'title', '') or str(message.chat.id)))}</b>",
         parse_mode=ParseMode.HTML,
@@ -1673,65 +1681,76 @@ async def gstatus_handler(message: Message) -> None:
     if not is_group_chat(message):
         return
     approved = await is_group_approved(message.chat.id)
+    global_mode = await get_global_mode()
     await message.reply(
-        f"Group auto lookup: <b>{'ON' if approved else 'OFF'}</b>",
+        f"Group auto lookup: <b>{'ON' if approved else 'OFF'}</b>\nGlobal mode: <b>{'ON' if global_mode else 'OFF'}</b>",
         parse_mode=ParseMode.HTML,
     )
+
+
+@router.message(Command("approve"))
+async def approve_handler(message: Message, command: CommandObject, bot: Bot) -> None:
+    asyncio.create_task(remember_chat(message))
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
+        return
+    target = await resolve_user_reference(message, bot, command.args)
+    if not target:
+        await message.reply("အသုံးပြုပုံ:\nReply + /approve\n/approve @username\n/approve 123456789")
+        return
+    await set_access(approved_users, target, message.from_user.id, True)
+    await message.reply(f"Approved: <b>{html_escape(format_target_user(target))}</b>", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("addsudo"))
 async def addsudo_handler(message: Message, command: CommandObject, bot: Bot) -> None:
     asyncio.create_task(remember_chat(message))
-    user_id = message.from_user.id if message.from_user else None
-    if not await is_owner_user(user_id):
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
     target = await resolve_user_reference(message, bot, command.args)
     if not target:
         await message.reply("အသုံးပြုပုံ:\nReply + /addsudo\n/addsudo @username\n/addsudo 123456789")
         return
-    await set_access(sudo_users, target, user_id, True)
+    await set_access(sudo_users, target, message.from_user.id, True)
+    await set_access(approved_users, target, message.from_user.id, True)
     await message.reply(f"Sudo added: <b>{html_escape(format_target_user(target))}</b>", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("rmsudo"))
 async def rmsudo_handler(message: Message, command: CommandObject, bot: Bot) -> None:
     asyncio.create_task(remember_chat(message))
-    user_id = message.from_user.id if message.from_user else None
-    if not await is_owner_user(user_id):
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
     target = await resolve_user_reference(message, bot, command.args)
     if not target:
         await message.reply("အသုံးပြုပုံ:\nReply + /rmsudo\n/rmsudo @username\n/rmsudo 123456789")
         return
-    await set_access(sudo_users, target, user_id, False)
+    await set_access(sudo_users, target, message.from_user.id, False)
     await message.reply(f"Sudo removed: <b>{html_escape(format_target_user(target))}</b>", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("blacklist"))
 async def blacklist_handler(message: Message, command: CommandObject, bot: Bot) -> None:
     asyncio.create_task(remember_chat(message))
-    user_id = message.from_user.id if message.from_user else None
-    if not await is_owner_user(user_id):
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
     target = await resolve_user_reference(message, bot, command.args)
     if not target:
         await message.reply("အသုံးပြုပုံ:\nReply + /blacklist\n/blacklist @username\n/blacklist 123456789")
         return
-    await set_access(blacklisted_users, target, user_id, True)
+    await set_access(blacklisted_users, target, message.from_user.id, True)
     await message.reply(f"Blacklisted: <b>{html_escape(format_target_user(target))}</b>", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("unblacklist"))
 async def unblacklist_handler(message: Message, command: CommandObject, bot: Bot) -> None:
     asyncio.create_task(remember_chat(message))
-    user_id = message.from_user.id if message.from_user else None
-    if not await is_owner_user(user_id):
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
     target = await resolve_user_reference(message, bot, command.args)
     if not target:
         await message.reply("အသုံးပြုပုံ:\nReply + /unblacklist\n/unblacklist @username\n/unblacklist 123456789")
         return
-    await set_access(blacklisted_users, target, user_id, False)
+    await set_access(blacklisted_users, target, message.from_user.id, False)
     await message.reply(f"Unblacklisted: <b>{html_escape(format_target_user(target))}</b>", parse_mode=ParseMode.HTML)
 
 
@@ -1787,14 +1806,17 @@ async def media_handler(message: Message, bot: Bot) -> None:
     if is_private_chat(message) and not await ensure_force_join_access(message, bot, group_prompt=False, dm_prompt=True):
         return
 
-    if not await can_use_lookup(message):
-        await require_lookup_access(message)
+    if not await is_allowed_user(message):
+        user_id = message.from_user.id if message.from_user else None
+        if await is_blacklisted_user(user_id):
+            return
+        await require_access(message)
         return
 
     parsed = get_effective_parsed_message(message)
     try:
-        command_candidates = get_effective_command_candidates_for_message(message, parsed)
-        await lookup_and_reply(message, message, bot, command_candidates=command_candidates)
+        override_cmd = get_effective_command_for_message(message, parsed)
+        await lookup_and_reply(message, message, bot, override_command_name=override_cmd)
     except Exception as exc:
         logger.exception("lookup failed")
         await message.reply(f"စစ်ဆေးရာမှာ error ဖြစ်နေပါတယ်: {exc}")
@@ -1809,9 +1831,8 @@ async def on_startup(bot: Bot) -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Start the bot"),
-            BotCommand(command="status", description="Show bot status"),
-            BotCommand(command="stats", description="Admin stats"),
-            BotCommand(command="gapprove", description="Approve group auto lookup"),
+            BotCommand(command="status", description="Show bot database status"),
+            BotCommand(command="stats", description="Owner stats"),
         ]
     )
     me = await bot.get_me()
@@ -1920,8 +1941,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try:
-        if uvloop is not None:
-            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped")
