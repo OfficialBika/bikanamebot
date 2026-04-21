@@ -817,15 +817,8 @@ def get_effective_command_for_message(message: Message, parsed: Optional[ParsedT
 
 
 def is_group_auto_lookup_source_message(message: Message) -> bool:
-    if get_inline_source_command(message):
-        return True
-    if get_forward_source_command(message):
-        return True
-    if is_character_catcher_style_message(message):
-        return True
-    if is_hallow_forward_source_message(message):
-        return True
-    return False
+    parsed = get_effective_parsed_message(message)
+    return bool(get_effective_command_for_message(message, parsed))
 
 # -----------------------------------------------------
 # Force join
@@ -978,21 +971,17 @@ async def refresh_force_join_flags(bot: Bot, user_id: Optional[int]) -> tuple[bo
 
 
 async def get_force_join_flags_cached(bot: Bot, user_id: int) -> tuple[bool, bool]:
-    row = await known_users.find_one(
-        {"user_id": user_id},
-        {"cjoin": 1, "gjoin": 1, "join_checked_at": 1}
-    )
-
+    row = await known_users.find_one({"user_id": user_id}, {"cjoin": 1, "gjoin": 1, "join_checked_at": 1})
     if row:
         checked_at = row.get("join_checked_at")
-        if isinstance(checked_at, datetime):
+        cjoin = bool(row.get("cjoin"))
+        gjoin = bool(row.get("gjoin"))
+        if cjoin and gjoin and isinstance(checked_at, datetime):
             if checked_at.tzinfo is None:
                 checked_at = checked_at.replace(tzinfo=timezone.utc)
-
             age = (datetime.now(timezone.utc) - checked_at).total_seconds()
             if age <= FORCE_JOIN_CACHE_SECONDS:
-                return bool(row.get("cjoin")), bool(row.get("gjoin"))
-
+                return True, True
     return await refresh_force_join_flags(bot, user_id)
 
 
@@ -1274,8 +1263,8 @@ async def build_status_text() -> str:
     lines = [
         "♻ <b>LOOKUP BOT STATUS</b>",
         f"‣ Total Media : <b>{total_media}</b>",
-        f"‣ Total Users : <b>{total_users}</b>",
-        f"‣ Total Groups : <b>{total_groups}</b>",
+        f"‣ Known Users : <b>{total_users}</b>",
+        f"‣ Known Groups : <b>{total_groups}</b>",
         f"‣ GApproved Groups : <b>{gapproved_count}</b>",
         f"‣ Blacklisted Users : <b>{blacklisted_count}</b>",
         f"‣ Global Mode : <b>{'ON' if global_mode else 'OFF'}</b>",
@@ -1284,6 +1273,7 @@ async def build_status_text() -> str:
         f"‣ Snapshot Items : <b>{SNAPSHOT.count}</b>",
         f"‣ Snapshot Age : <b>{int(SNAPSHOT.age_seconds())}s</b>",
         f"‣ Result Cache : <b>{len(RESULT_CACHE.data)}</b>",
+        f"‣ Latency : <b>{perf['lookup_ema_ms']:.2f}ms</b>",
         "",
         "🎮 <b>Saved Media By Cmd</b>",
         *saved_by_cmd_lines,
@@ -1419,6 +1409,18 @@ async def require_access(message: Message) -> bool:
     await message.reply(
         "ဒီ bot ကိုသုံးဖို့ owner approval လိုပါတယ်。\nOwner ကို Legendary 1 card ပေးပြီး approve လုပ်ခိုင်းပါ။"
     )
+    return False
+
+
+async def can_use_lookup(message: Message) -> bool:
+    user_id = message.from_user.id if message.from_user else None
+    return bool(user_id) and not await is_blacklisted_user(user_id)
+
+
+async def require_lookup_access(message: Message) -> bool:
+    if await can_use_lookup(message):
+        return True
+    await message.reply("You are blacklisted from using this bot.")
     return False
 
 
@@ -1811,11 +1813,8 @@ async def media_handler(message: Message, bot: Bot) -> None:
     if is_private_chat(message) and not await ensure_force_join_access(message, bot, group_prompt=False, dm_prompt=True):
         return
 
-    if not await is_allowed_user(message):
-        user_id = message.from_user.id if message.from_user else None
-        if await is_blacklisted_user(user_id):
-            return
-        await require_access(message)
+    if not await can_use_lookup(message):
+        await require_lookup_access(message)
         return
 
     parsed = get_effective_parsed_message(message)
