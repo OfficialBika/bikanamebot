@@ -573,8 +573,8 @@ def build_result_text(item: dict[str, Any], command_name: Optional[str] = None) 
     lines = [
         f"<b>NAME :</b> <code>{html_escape(name)}</code>",
         "────────────────",
-        f"🔹 <b>Hint :</b> <code>{html_escape(f'{command_name} {hint_name}')}</code>",
-        f"🔸 <b>Full :</b> <code>{html_escape(f'{command_name} {name}')}</code>",
+        f"❤ <b>Hint :</b> <code>{html_escape(f'{command_name} {hint_name}')}</code>",
+        f"❣ <b>Full :</b> <code>{html_escape(f'{command_name} {name}')}</code>",
         "",
         powered_by_html(),
     ]
@@ -1273,7 +1273,6 @@ async def build_status_text() -> str:
         f"‣ Snapshot Items : <b>{SNAPSHOT.count}</b>",
         f"‣ Snapshot Age : <b>{int(SNAPSHOT.age_seconds())}s</b>",
         f"‣ Result Cache : <b>{len(RESULT_CACHE.data)}</b>",
-        f"‣ Latency : <b>{perf['lookup_ema_ms']:.2f}ms</b>",
         "",
         "🎮 <b>Saved Media By Cmd</b>",
         *saved_by_cmd_lines,
